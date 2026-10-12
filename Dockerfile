@@ -45,6 +45,7 @@ RUN set -eux; \
 RUN mkdir -p /etc/x-ui /var/log/x-ui /run/nginx
 
 COPY nginx.conf.template /opt/nginx.conf.template
+COPY sub.html /opt/sub.html
 COPY entrypoint.sh /opt/entrypoint.sh
 RUN chmod +x /opt/entrypoint.sh
 

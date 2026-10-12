@@ -67,7 +67,22 @@ http {
         # The sub server serves the panel's generated subPath on @@SUB_PORT@@.
         # A stable public path (/sub/) is exposed and rewritten onto it, so the
         # link you put in v2rayNG never changes when the panel rotates it.
+
+        # /sub on its own serves a small viewer that decodes the base64 and
+        # shows the links, because the raw endpoint is not human readable.
+        location = @@SUB_PATH_NOSLASH@@ {
+            default_type text/html;
+            alias /opt/sub.html;
+        }
+
         location @@SUB_PATH@@ {
+            # Drop a trailing slash before proxying. The sub server is a Go
+            # mux mounted at @@SUB_REAL_PATH@@; asked for <id>/ it answers 301
+            # to @@SUB_REAL_PATH@@<id>, an absolute path outside /sub/, which
+            # then falls into "location /" and 404s. Chrome appends that slash
+            # on its own, so /sub/mobile/ has to work too.
+            rewrite ^@@SUB_PATH@@$ @@SUB_PATH_NOSLASH@@ last;
+            rewrite ^@@SUB_PATH@@(.+?)/+$ @@SUB_PATH@@$1 last;
             rewrite ^@@SUB_PATH@@(.*)$ @@SUB_REAL_PATH@@$1 break;
             proxy_pass http://127.0.0.1:@@SUB_PORT@@;
             proxy_http_version 1.1;

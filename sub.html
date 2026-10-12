@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ساب‌اسکریپشن</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px 16px 40px;
+    font-family: system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif;
+    background: #0d1117; color: #e6edf3; line-height: 1.7;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.hint { margin: 0 0 18px; color: #8b949e; font-size: 13px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=text] {
+    flex: 1 1 180px; min-width: 0; padding: 11px 12px; font-size: 15px;
+    background: #161b22; color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 8px; direction: ltr; text-align: left;
+  }
+  button {
+    padding: 11px 18px; font-size: 15px; cursor: pointer;
+    background: #238636; color: #fff; border: 0; border-radius: 8px;
+  }
+  button.secondary { background: #21262d; border: 1px solid #30363d; color: #e6edf3; }
+  button:disabled { opacity: .5; cursor: default; }
+  .out { margin-top: 20px; }
+  .line {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 10px 12px; margin-bottom: 8px; word-break: break-all;
+    direction: ltr; text-align: left; font-size: 12px; font-family: ui-monospace, monospace;
+  }
+  .err { background: #3d1418; border-color: #f85149; padding: 12px; border-radius: 8px; }
+  .muted { color: #8b949e; font-size: 13px; }
+  a { color: #58a6ff; }
+  code { direction: ltr; display: inline-block; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ساب‌اسکریپشن</h1>
+  <p class="hint">
+    لینک ساب را در اپ (v2rayNG / Streisand) وارد کن — این صفحه فقط برای دیدن
+    کانفیگ‌هاست، جای paste کردن نیست.
+  </p>
+
+  <div class="row">
+    <input type="text" id="id" value="mobile" spellcheck="false" inputmode="text">
+    <button id="go">نمایش</button>
+    <button id="copy" class="secondary">کپی همه</button>
+  </div>
+
+  <p class="muted" id="status"></p>
+  <div class="out" id="out"></div>
+
+  <p class="muted" id="link"></p>
+</div>
+
+<script>
+(function () {
+  var idEl = document.getElementById('id');
+  var outEl = document.getElementById('out');
+  var statusEl = document.getElementById('status');
+  var linkEl = document.getElementById('link');
+  var lastLines = [];
+
+  function subUrl(id) { return '/sub/' + encodeURIComponent(id); }
+
+  function showLink(id) {
+    var u = location.origin + subUrl(id);
+    linkEl.textContent = '';
+    var a = document.createElement('a');
+    a.href = u; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = u;
+    linkEl.appendChild(document.createTextNode('لینک ساب: '));
+    linkEl.appendChild(a);
+  }
+
+  function fail(msg) {
+    statusEl.textContent = '';
+    outEl.innerHTML = '';
+    var d = document.createElement('div');
+    d.className = 'line err';
+    d.textContent = msg;
+    outEl.appendChild(d);
+  }
+
+  function load() {
+    var id = idEl.value.trim();
+    if (!id) { fail('یک Sub ID بنویس.'); return; }
+    statusEl.textContent = 'در حال گرفتن…';
+    outEl.innerHTML = '';
+    showLink(id);
+
+    fetch(subUrl(id), { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text();
+      })
+      .then(function (body) {
+        var text = body;
+        try {
+          var decoded = atob(body.replace(/\s+/g, ''));
+          // atob gives latin1; re-decode as UTF-8 so Persian remarks survive.
+          var bytes = Uint8Array.from(decoded, function (c) { return c.charCodeAt(0); });
+          text = new TextDecoder('utf-8').decode(bytes);
+        } catch (e) {
+          // Not base64 (e.g. the panel returned JSON or an error page). Show raw.
+        }
+        var lines = text.split(/\r?\n/).map(function (s) { return s.trim(); })
+                        .filter(function (s) { return s.length > 0; });
+        lastLines = lines;
+        statusEl.textContent = '';
+        if (!lines.length) {
+          fail('چیزی برنگشت. یعنی کلاینتی با این Sub ID وجود ندارد، یا Sub ID را اشتباه نوشته‌ای.');
+          return;
+        }
+        statusEl.textContent = lines.length + ' کانفیگ';
+        lines.forEach(function (l) {
+          var d = document.createElement('div');
+          d.className = 'line';
+          d.textContent = l;
+          outEl.appendChild(d);
+        });
+      })
+      .catch(function (e) { fail('خطا: ' + e.message); });
+  }
+
+  document.getElementById('go').addEventListener('click', load);
+  idEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') load(); });
+
+  document.getElementById('copy').addEventListener('click', function () {
+    if (!lastLines.length) return;
+    var text = lastLines.join('\n');
+    var done = function () { statusEl.textContent = 'کپی شد.'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallback(); });
+    } else { fallback(); }
+    function fallback() {
+      var t = document.createElement('textarea');
+      t.value = text; document.body.appendChild(t); t.select();
+      try { document.execCommand('copy'); done(); } catch (e) {}
+      document.body.removeChild(t);
+    }
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>

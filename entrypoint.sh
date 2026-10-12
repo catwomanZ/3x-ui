@@ -426,12 +426,17 @@ PY
 )"
 fi
 SUB_REAL_PATH="${SUB_REAL_PATH:-/subs/}"
+# The viewer page is served at the bare /sub (no trailing slash), while the
+# prefix location below keeps the slash form the proxy rewrite expects.
+SUB_PATH_NOSLASH="${SUB_PATH%/}"
+[ -n "$SUB_PATH_NOSLASH" ] || SUB_PATH_NOSLASH="/"
 RENDERED="${RUNTIME_DIR}/nginx.conf"
 sed -e "s|@@HTTP_PORT@@|${HTTP_PORT}|g" \
     -e "s|@@PANEL_PORT@@|${PANEL_PORT}|g" \
     -e "s|@@PANEL_PATH@@|${PANEL_PATH}|g" \
     -e "s|@@SUB_PORT@@|${SUB_PORT}|g" \
     -e "s|@@SUB_PATH@@|${SUB_PATH}|g" \
+    -e "s|@@SUB_PATH_NOSLASH@@|${SUB_PATH_NOSLASH}|g" \
     -e "s|@@SUB_REAL_PATH@@|${SUB_REAL_PATH}|g" \
     -e "s|@@INBOUND_PORT@@|${INBOUND_PORT}|g" \
     -e "s|@@TUNNEL_PATH@@|${TUNNEL_PATH}|g" \
