@@ -6,7 +6,7 @@
 
 بدون VPS، بدون دامنه، بدون Cloudflare. لینک ساب می‌گیری، روی گوشی کار می‌کند.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/TEMPLATE_CODE)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new)
 [![Star on GitHub](https://img.shields.io/github/stars/catwomanZ/3x-ui.3.9.0?style=social)](https://github.com/catwomanZ/3x-ui.3.9.0)
 
 </div>
@@ -17,12 +17,15 @@
 
 ### ۱. ریپو را فورک کن
 
-دکمه‌ی **Fork** بالای همین صفحه. (اگر از دکمه‌ی Deploy بالا آمده‌ای، Railway
-خودش یک کپی در GitHub تو می‌سازد.)
+دکمه‌ی **Fork** بالای همین صفحه.
 
 ### ۲. روی Railway دیپلوی کن
 
-**New Project** → **Deploy from GitHub repo** → ریپوی فورک‌شده.
+دکمه‌ی بالا → **New Project** → **Deploy from GitHub repo** → ریپوی فورک‌شده.
+
+> دکمه‌ی بالا فقط درِ Railway را باز می‌کند و **ریپو را خودش انتخاب
+> نمی‌کند**. برای اینکه تک‌کلیک واقعی شود و ریپو از پیش انتخاب‌شده باشد،
+> سازنده باید یک Railway Template منتشر کند (پایین صفحه توضیح داده شده).
 
 ### ۳. دو تا چیز را دستی ست کن
 
@@ -157,6 +160,22 @@ client ──https──▶ Railway edge (TLS) ──http──▶ nginx :$PORT
 v2box با این هدر «شکست» می‌زد، با اینکه خود کانفیگ‌ها سالم رسیده بودند.
 forwarder آن هدر را در این حالت نمی‌فرستد. سقف حجم که بگذاری، هدر با عدد
 واقعی برمی‌گردد.
+
+---
+
+---
+
+## 🔧 برای نگهدارنده: تک‌کلیک واقعی کردن دکمه
+
+دکمه‌ی Deploy برای اینکه ریپو را از پیش انتخاب‌شده باز کند، به یک **کد
+template** نیاز دارد. آن کد فقط از اکانت Railway سازنده ساخته می‌شود:
+
+1. پروژه را یک بار کامل بالا بیاور (Volume و Generate Domain ست شده باشد)
+2. در Railway: سرویس ← **⋮** ← **Generate Template**
+3. Template را **Publish** کن
+4. لینکی مثل `railway.com/new/template/AbCdEf` می‌گیری — همان `AbCdEf` کد است
+5. در خط دکمه‌ی بالای README، `https://railway.com/new` را با
+   `https://railway.com/new/template/AbCdEf` عوض کن
 
 ---
 
