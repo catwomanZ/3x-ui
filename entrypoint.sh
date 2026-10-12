@@ -45,6 +45,11 @@ TUNNEL_PATH="${TUNNEL_PATH:-/ws}"
 TRANSPORT="${TRANSPORT:-ws}"
 CLIENT_EMAIL="${CLIENT_EMAIL:-user1}"
 CLIENT_SUBID="${CLIENT_SUBID:-mobile}"
+SUBPAGE_PORT="${SUBPAGE_PORT:-2097}"
+BRAND="${BRAND:-CATWOMAN}"
+# Names the configs exactly as they show up in the client app. {{EMAIL}} is the
+# per-user email typed in the panel, so every client gets its own line.
+REMARK_TEMPLATE="${REMARK_TEMPLATE:-${BRAND} • {{EMAIL}}}"
 
 # Normalise PANEL_PATH: 3x-ui wants a leading and trailing slash, and nginx
 # prefix matching needs exactly that form too.
@@ -407,6 +412,34 @@ export ADMIN_USERNAME ADMIN_PASSWORD APPLY_CREDS
 if [ "$APPLY_CREDS" = "1" ]; then
   "$XUI_BIN" setting -username "$ADMIN_USERNAME" -password "$ADMIN_PASSWORD" >/dev/null
 fi
+
+# remarkTemplate has no CLI flag, so it goes straight into the settings table.
+# It is what every share link and subscription entry is named after, which is
+# where the branding the clients actually see comes from. Written before the
+# panel starts so the first render already uses it. Only overwrite when the
+# stored value is still the upstream default or empty, so a template someone
+# tuned by hand in Panel Settings is not clobbered on every restart.
+REMARK_DEFAULT='{{INBOUND}}-{{EMAIL}}|📊{{TRAFFIC_LEFT}}|⏳{{DAYS_LEFT}}D'
+python3 - "$REMARK_TEMPLATE" "$REMARK_DEFAULT" <<'PY'
+import sqlite3, sys
+want, upstream = sys.argv[1], sys.argv[2]
+try:
+    con = sqlite3.connect("/etc/x-ui/x-ui.db")
+    row = con.execute("SELECT value FROM settings WHERE key='remarkTemplate'").fetchone()
+    cur = row[0] if row else ""
+    if cur and cur != upstream:
+        print(f"[entrypoint] remarkTemplate already customised; leaving {cur!r}")
+    else:
+        if row:
+            con.execute("UPDATE settings SET value=? WHERE key='remarkTemplate'", (want,))
+        else:
+            con.execute("INSERT INTO settings(key,value) VALUES('remarkTemplate',?)", (want,))
+        con.commit()
+        print(f"[entrypoint] remarkTemplate set to {want!r}")
+except Exception as e:
+    print(f"[entrypoint] WARNING: could not set remarkTemplate: {e}")
+PY
+
 log "panel configured: port ${PANEL_PORT}, base path ${PANEL_PATH}; credentials ${CREDS_NOTE}"
 
 # --- 2/3/4. panel + inbound --------------------------------------------------
@@ -474,7 +507,26 @@ sed -e "s|@@HTTP_PORT@@|${HTTP_PORT}|g" \
     -e "s|@@SUB_REAL_PATH@@|${SUB_REAL_PATH}|g" \
     -e "s|@@INBOUND_PORT@@|${INBOUND_PORT}|g" \
     -e "s|@@TUNNEL_PATH@@|${TUNNEL_PATH}|g" \
+    -e "s|@@SUBPAGE_PORT@@|${SUBPAGE_PORT}|g" \
+    -e "s|@@BRAND@@|${BRAND}|g" \
     /opt/nginx.conf.template > "$RENDERED"
+
+# --- 4b. subscription page ----------------------------------------------------
+# Renders /sub. Needs the panel's real subPath to reach the sub server, so it
+# starts after bootstrap has handed it back.
+SUBPAGE_PID=""
+if [ -f /opt/subserver.py ]; then
+  SUBPAGE_PORT="$SUBPAGE_PORT" \
+  SUB_PORT="$SUB_PORT" \
+  SUB_REAL_PATH="$SUB_REAL_PATH" \
+  PUBLIC_HOST="$PUBLIC_HOST" \
+  CLIENT_SUBID="$CLIENT_SUBID" \
+  BRAND="$BRAND" \
+  BRAND_URL="${BRAND_URL:-https://t.me/Catwoman_ZaHra}" \
+    python3 /opt/subserver.py &
+  SUBPAGE_PID=$!
+  log "subscription page started (pid ${SUBPAGE_PID}) on :${SUBPAGE_PORT}"
+fi
 
 nginx -t -c "$RENDERED" || { log "FATAL: rendered nginx config is invalid"; exit 1; }
 nginx -c "$RENDERED" || { log "FATAL: nginx would not start on :${HTTP_PORT}"; stop_panel; exit 1; }
@@ -528,7 +580,7 @@ echo "=============================================================="
 echo
 
 # --- supervise ---------------------------------------------------------------
-trap 'stop_panel; nginx -s quit 2>/dev/null || true; exit 0' TERM INT
+trap 'stop_panel; [ -n "$SUBPAGE_PID" ] && kill "$SUBPAGE_PID" 2>/dev/null; nginx -s quit 2>/dev/null || true; exit 0' TERM INT
 
 while true; do
   if ! kill -0 "$PANEL_PID" 2>/dev/null; then
@@ -540,6 +592,16 @@ while true; do
     log "nginx exited; shutting down so Railway restarts the container"
     stop_panel
     exit 1
+  fi
+  # The subscription page is not fatal: without it the raw /sub/<id> endpoint
+  # still works, so restart it rather than taking the whole service down.
+  if [ -n "$SUBPAGE_PID" ] && ! kill -0 "$SUBPAGE_PID" 2>/dev/null; then
+    log "subscription page exited; restarting it"
+    SUBPAGE_PORT="$SUBPAGE_PORT" SUB_PORT="$SUB_PORT" SUB_REAL_PATH="$SUB_REAL_PATH" \
+    PUBLIC_HOST="$PUBLIC_HOST" CLIENT_SUBID="$CLIENT_SUBID" BRAND="$BRAND" \
+    BRAND_URL="${BRAND_URL:-https://t.me/Catwoman_ZaHra}" \
+      python3 /opt/subserver.py &
+    SUBPAGE_PID=$!
   fi
   sleep 5
 done

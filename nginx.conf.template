@@ -61,6 +61,32 @@ http {
             proxy_set_header X-Forwarded-Proto https;
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
+
+            # --- rebrand --------------------------------------------------
+            # The frontend is compiled into the x-ui binary (go:embed all:dist),
+            # so there is no file on disk to patch. nginx sits in front of it,
+            # so the brand is rewritten on the way through instead.
+            #
+            # sub_filter needs an uncompressed body, hence proxy_set_header
+            # Accept-Encoding "". The CSS classes are left alone, so nothing
+            # about the layout or the font changes.
+            #
+            # Each pattern is scoped to the brand element. A bare "3X-UI"
+            # replacement would also hit strings like "🚀 3X-UI Version:" and
+            # the update dialogs, which should keep naming the real project.
+            proxy_set_header Accept-Encoding "";
+            sub_filter_once off;
+            # text/html is always filtered by default; listing it again makes
+            # nginx warn about a duplicate MIME type.
+            sub_filter_types application/javascript text/javascript;
+            # login page brand
+            sub_filter 'brand-name`,children:`3X-UI`'   'brand-name`,children:`@@BRAND@@`';
+            # sidebar brand (expanded and collapsed forms)
+            sub_filter 'children:E?`3X`:`3X-UI`'        'children:E?`@@BRAND@@`:`@@BRAND@@`';
+            # mobile drawer brand
+            sub_filter 'drawer-brand`,children:`3X-UI`' 'drawer-brand`,children:`@@BRAND@@`';
+            # browser tab title
+            sub_filter '<title>Sign in</title>'          '<title>@@BRAND@@</title>';
         }
 
         # --- Subscription -----------------------------------------------------
@@ -68,20 +94,25 @@ http {
         # A stable public path (/sub/) is exposed and rewritten onto it, so the
         # link you put in v2rayNG never changes when the panel rotates it.
 
-        # /sub on its own serves a small viewer that decodes the base64 and
-        # shows the links, because the raw endpoint is not human readable.
+        # /sub is the human-readable page, rendered by the Python sidecar. It
+        # decodes the base64 server side, so what a browser shows is exactly
+        # what curl gets -- a static JS page could not be verified that way and
+        # shipped blank once.
         location = @@SUB_PATH_NOSLASH@@ {
-            default_type text/html;
-            alias /opt/sub.html;
+            proxy_pass http://127.0.0.1:@@SUBPAGE_PORT@@;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
         }
 
         location @@SUB_PATH@@ {
+            # Bare /sub/ -> the viewer.
+            rewrite ^@@SUB_PATH@@$ @@SUB_PATH_NOSLASH@@ last;
             # Drop a trailing slash before proxying. The sub server is a Go
             # mux mounted at @@SUB_REAL_PATH@@; asked for <id>/ it answers 301
             # to @@SUB_REAL_PATH@@<id>, an absolute path outside /sub/, which
             # then falls into "location /" and 404s. Chrome appends that slash
             # on its own, so /sub/mobile/ has to work too.
-            rewrite ^@@SUB_PATH@@$ @@SUB_PATH_NOSLASH@@ last;
             rewrite ^@@SUB_PATH@@(.+?)/+$ @@SUB_PATH@@$1 last;
             rewrite ^@@SUB_PATH@@(.*)$ @@SUB_REAL_PATH@@$1 break;
             proxy_pass http://127.0.0.1:@@SUB_PORT@@;
