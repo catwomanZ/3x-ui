@@ -112,14 +112,26 @@ http {
             # /sub/mobile/ has to resolve exactly like /sub/mobile.
             rewrite ^@@SUB_PATH@@(.+?)/+$ @@SUB_PATH@@$1 last;
 
-            # Everything under /sub/ goes to the page renderer, not straight to
-            # 3x-ui's sub server. That is what fixes the blank screen: the panel
-            # hands out /sub/<id>, and 3x-ui answers that with raw base64 and
-            # text/plain -- which a VPN app consumes happily but Chrome on a
-            # phone shows as an empty white screen. The renderer inspects the
-            # client and forwards the raw feed to apps while serving HTML to
-            # browsers, so one URL does both jobs.
+            # A thin forwarder in front of 3x-ui's own sub server. The page a
+            # browser gets is 3x-ui's built-in subpage.html; the forwarder only
+            # exists to apply one policy -- it drops the Subscription-Userinfo
+            # header when the client has no quota, because 3x-ui always emits
+            # total=0/expire=0 and apps such as v2box divide by total, fail and
+            # report an error even though the configs arrived fine.
             proxy_pass http://127.0.0.1:@@SUBPAGE_PORT@@;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+        }
+
+        # The built-in sub page is a Vite/React bundle and asks for its CSS and
+        # JS at /<subPath>/assets/... -- its own random path, not under /sub/.
+        # Without this rule every one of those requests falls into "location /"
+        # and 404s, and the page renders as an empty white screen.
+        location @@SUB_REAL_PATH@@ {
+            proxy_pass http://127.0.0.1:@@SUB_PORT@@;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;

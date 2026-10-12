@@ -50,6 +50,11 @@ BRAND="${BRAND:-CATWOMAN}"
 # Names the configs exactly as they show up in the client app. {{EMAIL}} is the
 # per-user email typed in the panel, so every client gets its own line.
 REMARK_TEMPLATE="${REMARK_TEMPLATE:-${BRAND} • {{EMAIL}}}"
+# The built-in subscription page has two slots of its own: a title rendered at
+# the top of the card, and an "announce" box rendered below it. Both are plain
+# panel settings, so the branding lives there rather than in a custom page.
+SUB_TITLE="${SUB_TITLE:-$BRAND}"
+SUB_ANNOUNCE="${SUB_ANNOUNCE:-ساخته شده توسط t.me/Catwoman_ZaHra}"
 
 # Normalise PANEL_PATH: 3x-ui wants a leading and trailing slash, and nginx
 # prefix matching needs exactly that form too.
@@ -444,6 +449,31 @@ except Exception as e:
     print(f"[entrypoint] WARNING: could not set remarkTemplate: {e}")
 PY
 
+# subTitle and subAnnounce are the two slots on 3x-ui's own subscription page:
+# the title at the top of the card and the announce box under it. Same rule as
+# remarkTemplate -- write them when unset or still empty, never over something
+# you typed into Panel Settings yourself.
+python3 - "$SUB_TITLE" "$SUB_ANNOUNCE" <<'PY'
+import sqlite3, sys
+values = {"subTitle": sys.argv[1], "subAnnounce": sys.argv[2]}
+try:
+    con = sqlite3.connect("/etc/x-ui/x-ui.db")
+    for key, want in values.items():
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        cur = row[0] if row else ""
+        if cur:
+            print(f"[entrypoint] {key} already set; leaving {cur!r}")
+            continue
+        if row:
+            con.execute("UPDATE settings SET value=? WHERE key=?", (want, key))
+        else:
+            con.execute("INSERT INTO settings(key,value) VALUES(?,?)", (key, want))
+        print(f"[entrypoint] {key} set to {want!r}")
+    con.commit()
+except Exception as e:
+    print(f"[entrypoint] WARNING: could not set the subscription page text: {e}")
+PY
+
 # Existing deployments carry the old default name. Bootstrap only runs when
 # credentials are being applied, so anyone who changed their password in the
 # panel and dropped ADMIN_PASSWORD from Variables would never get the rename --
@@ -569,10 +599,8 @@ if [ -f /opt/subserver.py ]; then
   SUBPAGE_PORT="$SUBPAGE_PORT" \
   SUB_PORT="$SUB_PORT" \
   SUB_REAL_PATH="$SUB_REAL_PATH" \
-  PUBLIC_HOST="$PUBLIC_HOST" \
+  SUB_PATH="$SUB_PATH" \
   CLIENT_SUBID="$CLIENT_SUBID" \
-  BRAND="$BRAND" \
-  BRAND_URL="${BRAND_URL:-https://t.me/Catwoman_ZaHra}" \
     python3 /opt/subserver.py &
   SUBPAGE_PID=$!
   log "subscription page started (pid ${SUBPAGE_PID}) on :${SUBPAGE_PORT}"
@@ -608,10 +636,10 @@ if [ -n "${DEFAULT_CREDS:-}" ]; then
   echo "     sticks across restarts, nothing here overwrites it."
 fi
 echo "  Subscription   ${SUB_URL}"
-echo "                 ^ Open it in a browser: it shows the configs as a page."
+echo "                 ^ Open it in a browser: 3x-ui's own subscription page."
 echo "                   Paste it into a VPN app: the same address hands the"
-echo "                   app the raw feed. It decides by who is asking, so one"
-echo "                   link does both and you never explain the difference."
+echo "                   app the raw feed. The panel decides by who is asking."
+echo "                   Title: ${SUB_TITLE}"
 echo "                 ^ give every new client subId \"${CLIENT_SUBID}\" and it"
 echo "                   appears in this same link automatically. No new link,"
 echo "                   no new inbound, nothing to hand out per person."
@@ -651,9 +679,9 @@ while true; do
   # still works, so restart it rather than taking the whole service down.
   if [ -n "$SUBPAGE_PID" ] && ! kill -0 "$SUBPAGE_PID" 2>/dev/null; then
     log "subscription page exited; restarting it"
-    SUBPAGE_PORT="$SUBPAGE_PORT" SUB_PORT="$SUB_PORT" SUB_REAL_PATH="$SUB_REAL_PATH" \
-    PUBLIC_HOST="$PUBLIC_HOST" CLIENT_SUBID="$CLIENT_SUBID" BRAND="$BRAND" \
-    BRAND_URL="${BRAND_URL:-https://t.me/Catwoman_ZaHra}" \
+    SUBPAGE_PORT="$SUBPAGE_PORT" SUB_PORT="$SUB_PORT" \
+    SUB_REAL_PATH="$SUB_REAL_PATH" SUB_PATH="$SUB_PATH" \
+    CLIENT_SUBID="$CLIENT_SUBID" \
       python3 /opt/subserver.py &
     SUBPAGE_PID=$!
   fi
