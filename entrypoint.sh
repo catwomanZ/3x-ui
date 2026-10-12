@@ -65,9 +65,13 @@ case "$SUB_PATH" in
   *)  SUB_PATH="/${SUB_PATH}/" ;;
 esac
 
-export PANEL_PATH SUB_PATH TUNNEL_PATH HTTP_PORT PANEL_PORT SUB_PORT INBOUND_PORT
-export TRANSPORT CLIENT_EMAIL CLIENT_SUBID
-export PANEL_PORT INBOUND_PORT
+  export PANEL_PATH SUB_PATH TUNNEL_PATH HTTP_PORT PANEL_PORT SUB_PORT INBOUND_PORT
+  export TRANSPORT CLIENT_EMAIL CLIENT_SUBID
+  # BRAND is read inside bootstrap.sh (the inbound gets named after it), and
+  # bootstrap.sh runs under `set -u`, so it has to be exported -- an unexported
+  # variable there is an "unbound variable" error, not a silent empty string.
+  export BRAND REMARK_TEMPLATE
+  export PANEL_PORT INBOUND_PORT
 
 # The public hostname is what every generated link contains. Railway only
 # injects RAILWAY_PUBLIC_DOMAIN *after* you press "Generate Domain", and it
@@ -135,7 +139,7 @@ TRANSPORT="${TRANSPORT:-ws}"             # ws | xhttp  (ws works in every client
 TUNNEL_PATH="${TUNNEL_PATH:-/ws}"                 # public path nginx exposes; also the internal path
 CLIENT_EMAIL="${CLIENT_EMAIL:-user1}"
 CLIENT_SUBID="${CLIENT_SUBID:-mobile}"
-INBOUND_REMARK="${INBOUND_REMARK:-railway}"
+INBOUND_REMARK="${INBOUND_REMARK:-$BRAND}"
 ADMIN_USERNAME="${ADMIN_USERNAME:?ADMIN_USERNAME is required}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}"
 BOOTSTRAP_TIMEOUT="${BOOTSTRAP_TIMEOUT:-90}"
@@ -236,7 +240,7 @@ stream = {"network": transport, "security": "none"}
 if host:
     stream["externalProxy"] = [{
         "forceTls": force_tls, "dest": host, "port": port,
-        "remark": "railway", "sni": host,
+        "remark": os.environ["INBOUND_REMARK"], "sni": host,
     }]
 
 if transport == "ws":
@@ -438,6 +442,52 @@ try:
         print(f"[entrypoint] remarkTemplate set to {want!r}")
 except Exception as e:
     print(f"[entrypoint] WARNING: could not set remarkTemplate: {e}")
+PY
+
+# Existing deployments carry the old default name. Bootstrap only runs when
+# credentials are being applied, so anyone who changed their password in the
+# panel and dropped ADMIN_PASSWORD from Variables would never get the rename --
+# their inbound would keep the old label for ever. So rename it here instead,
+# unconditionally and idempotently, before the panel reads the table.
+#
+# Only a stored value that is exactly the old default is touched. A name you
+# typed yourself in the panel is yours and survives every restart.
+python3 - "$BRAND" <<'PY'
+import json, sqlite3, sys
+brand = sys.argv[1]
+OLD = "railway"
+try:
+    con = sqlite3.connect("/etc/x-ui/x-ui.db")
+    rows = con.execute("SELECT id, remark, stream_settings FROM inbounds").fetchall()
+    renamed = 0
+    for iid, remark, ss in rows:
+        if remark == OLD:
+            con.execute("UPDATE inbounds SET remark=? WHERE id=?", (brand, iid))
+            renamed += 1
+        # The same old label is also stored inside streamSettings, under
+        # externalProxy -- that is the row the panel shows in its Hosts view.
+        if ss:
+            try:
+                obj = json.loads(ss)
+            except Exception:
+                continue
+            proxies = obj.get("externalProxy")
+            if isinstance(proxies, list):
+                dirty = False
+                for p in proxies:
+                    if isinstance(p, dict) and p.get("remark") == OLD:
+                        p["remark"] = brand
+                        dirty = True
+                if dirty:
+                    con.execute("UPDATE inbounds SET stream_settings=? WHERE id=?",
+                                (json.dumps(obj, ensure_ascii=False), iid))
+                    renamed += 1
+    if renamed:
+        con.commit()
+        print(f"[entrypoint] renamed the old '{OLD}' label to '{brand}' "
+              f"in {renamed} place(s)")
+except Exception as e:
+    print(f"[entrypoint] WARNING: could not rename the old inbound label: {e}")
 PY
 
 log "panel configured: port ${PANEL_PORT}, base path ${PANEL_PATH}; credentials ${CREDS_NOTE}"
