@@ -309,6 +309,40 @@ PY
 )"
 log "panel subscription path is ${SUB_REAL_PATH}"
 
+# --- subURI ------------------------------------------------------------------
+# Left empty, the panel builds the subscription link it shows on the Clients
+# page from subDomain and subPort, which gives
+# http://<domain>:2096<subPath><subId>. Railway exposes exactly one public port
+# over HTTPS, so that link can never be reached from a browser or an app.
+# subURI overrides it. Only fill in the broken defaults -- a custom domain the
+# admin typed by hand is left alone.
+if [ -n "$PUBLIC_HOST" ]; then
+  python3 - "$PUBLIC_HOST" "$SUB_PATH" <<'PY'
+import sqlite3, sys
+host, sub_path = sys.argv[1], sys.argv[2]
+want = f"https://{host}{sub_path}"
+db = "/etc/x-ui/x-ui.db"
+try:
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT value FROM settings WHERE key='subURI'").fetchone()
+    cur = row[0] if row else ""
+    if cur and ":2096" not in cur and not cur.startswith("http://"):
+        print(f"[bootstrap] subURI already set to {cur}; leaving it alone")
+    else:
+        if row:
+            con.execute("UPDATE settings SET value=? WHERE key='subURI'", (want,))
+        else:
+            con.execute("INSERT INTO settings(key,value) VALUES('subURI',?)", (want,))
+        con.commit()
+        print(f"[bootstrap] subURI set to {want}")
+except Exception as e:
+    print(f"[bootstrap] WARNING: could not set subURI: {e}")
+PY
+else
+  log "PUBLIC_HOST is empty; not setting subURI, so the panel will show a :2096 link"
+  log "set PUBLIC_HOST in Railway Variables (or Generate Domain then Redeploy)"
+fi
+
 # --- report ------------------------------------------------------------------
 # The entrypoint sources this file, so every value has to be shell-quoted.
 # A vless:// link ends in "#remark", and an unquoted '#' starts a comment:
