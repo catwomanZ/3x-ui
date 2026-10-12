@@ -35,6 +35,12 @@ fi
 export RUNTIME_DIR
 
 # --- configuration -----------------------------------------------------------
+# The panel renders dates in whatever zone the container is in, and Railway
+# containers come up on UTC. An operator in Tehran picking "tomorrow" then reads
+# a date three and a half hours off, which is enough for a client to look
+# expired when it is not. Default to the operator's zone; override with TZ.
+export TZ="${TZ:-Asia/Tehran}"
+
 HTTP_PORT="${HTTP_PORT:-${PORT:-8080}}"     # Railway injects PORT
 PANEL_PORT="${PANEL_PORT:-2053}"
 SUB_PORT="${SUB_PORT:-2096}"
@@ -54,7 +60,10 @@ REMARK_TEMPLATE="${REMARK_TEMPLATE:-${BRAND} • {{EMAIL}}}"
 # the top of the card, and an "announce" box rendered below it. Both are plain
 # panel settings, so the branding lives there rather than in a custom page.
 SUB_TITLE="${SUB_TITLE:-$BRAND}"
-SUB_ANNOUNCE="${SUB_ANNOUNCE:-ساخته شده توسط t.me/Catwoman_ZaHra}"
+SUB_ANNOUNCE="${SUB_ANNOUNCE:-این پنل توسط Catwoman ساخته شده}"
+# subSupportUrl is the one field the built-in page puts in its <footer>, so it
+# is the slot at the very bottom of the subscription page.
+SUB_SUPPORT_URL="${SUB_SUPPORT_URL:-t.me/Catwoman_ZaHra}"
 
 # Normalise PANEL_PATH: 3x-ui wants a leading and trailing slash, and nginx
 # prefix matching needs exactly that form too.
@@ -453,9 +462,10 @@ PY
 # the title at the top of the card and the announce box under it. Same rule as
 # remarkTemplate -- write them when unset or still empty, never over something
 # you typed into Panel Settings yourself.
-python3 - "$SUB_TITLE" "$SUB_ANNOUNCE" <<'PY'
+python3 - "$SUB_TITLE" "$SUB_ANNOUNCE" "$SUB_SUPPORT_URL" <<'PY'
 import sqlite3, sys
-values = {"subTitle": sys.argv[1], "subAnnounce": sys.argv[2]}
+values = {"subTitle": sys.argv[1], "subAnnounce": sys.argv[2],
+          "subSupportUrl": sys.argv[3]}
 try:
     con = sqlite3.connect("/etc/x-ui/x-ui.db")
     for key, want in values.items():
@@ -519,6 +529,31 @@ try:
 except Exception as e:
     print(f"[entrypoint] WARNING: could not rename the old inbound label: {e}")
 PY
+
+# A client whose expiryTime is stored in seconds rather than milliseconds reads
+# as a date in 1970, so it shows as expired the moment it is created. The panel
+# form sends milliseconds, so this should never happen -- but if it ever does,
+# say so in the log rather than leaving a client that silently looks dead.
+python3 - <<'PYCHK'
+import sqlite3, time
+try:
+    con = sqlite3.connect("/etc/x-ui/x-ui.db")
+    for email, sub_id, exp in con.execute(
+            "SELECT email, sub_id, expiry_time FROM clients"):
+        # expiry_time is milliseconds. Anything positive but far too small to be
+        # a millisecond timestamp is a date entered as seconds, which the panel
+        # reads as January 1970 and therefore shows as long expired.
+        if exp and 0 < exp < 10**11:
+            print("[entrypoint] WARNING: client %r (subId %r) has expiry_time=%s."
+                  " That is a date in seconds, but this field is milliseconds,"
+                  " so the panel reads it as %s and shows the client as expired."
+                  " Open the client in the panel and set the expiry again, or"
+                  " set it to 0 for unlimited."
+                  % (email, sub_id, exp,
+                     time.strftime("%Y-%m-%d", time.gmtime(exp / 1000.0))))
+except Exception as e:
+    print("[entrypoint] WARNING: could not check client expiry values: %s" % e)
+PYCHK
 
 log "panel configured: port ${PANEL_PORT}, base path ${PANEL_PATH}; credentials ${CREDS_NOTE}"
 
