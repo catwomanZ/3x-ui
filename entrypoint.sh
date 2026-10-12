@@ -73,14 +73,28 @@ PUBLIC_PORT="${PUBLIC_PORT:-443}"
 PUBLIC_TLS="${PUBLIC_TLS:-tls}"
 export PUBLIC_HOST PUBLIC_PORT PUBLIC_TLS
 
-ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
-if [ -z "${ADMIN_PASSWORD:-}" ]; then
-  ADMIN_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
-  GENERATED_PASSWORD=1
-fi
-export ADMIN_USERNAME ADMIN_PASSWORD
-
 log() { printf '[entrypoint] %s\n' "$*"; }
+
+# Reads the live panel username out of the database, so a credential changed
+# from the panel UI survives a reboot instead of being overwritten by the
+# defaults. The column name cannot be a bound parameter (SQLite would treat it
+# as a string literal), so it is matched against a whitelist instead.
+read_credential() {
+  case "$1" in
+    username) COL=username ;;
+    password) COL=password ;;
+    *) return 1 ;;
+  esac
+  python3 - "$COL" <<'PY'
+import sqlite3, sys
+try:
+    con = sqlite3.connect("/etc/x-ui/x-ui.db")
+    row = con.execute(f"SELECT {sys.argv[1]} FROM users ORDER BY id LIMIT 1").fetchone()
+    print(row[0] if row else "")
+except Exception:
+    print("")
+PY
+}
 
 # --- embedded bootstrap -----------------------------------------------------
 # Kept in this one file so the repository stays small enough to create from
@@ -128,6 +142,16 @@ trap 'rm -f "$JAR"' EXIT
 
 log()  { printf '[bootstrap] %s\n' "$*"; }
 die()  { printf '[bootstrap] ERROR: %s\n' "$*" >&2; return 1; }
+
+# APPLY_CREDS=0 means the entrypoint deliberately left the stored credentials
+# alone, so what we hold is a bcrypt hash rather than a password and there is
+# nothing to log in with. The inbound already exists from the first boot, so
+# leaving it untouched is the correct no-op.
+if [ "${APPLY_CREDS:-1}" = "0" ]; then
+  log "credentials come from the panel database; skipping inbound bootstrap"
+  log "to re-bootstrap the inbound, set ADMIN_PASSWORD in Railway Variables and redeploy"
+  exit 0
+fi
 
 # --- wait for the panel ------------------------------------------------------
 deadline=$(( $(date +%s) + BOOTSTRAP_TIMEOUT ))
@@ -313,16 +337,43 @@ BOOTSTRAP_EOF
 # --- 1. panel settings -------------------------------------------------------
 mkdir -p /etc/x-ui /var/log/x-ui
 
-FIRST_BOOT=0
-[ -f "$DB_FILE" ] || FIRST_BOOT=1
-
-# Credentials are applied on every boot when both are set, so setting them in
-# Railway's Variables is a reliable way back in if you forget the password.
+# Credentials. The trap here is that writing them on every boot would undo a
+# password you changed from the panel UI -- the CLI overwrites the database
+# unconditionally. So:
+#
+#   * no database yet (first boot, empty Volume): seed admin/admin so the
+#     service is usable with zero Variables.
+#   * database exists: leave the credentials alone, so what you set in
+#     Panel Settings survives restarts and redeploys.
+#   * ADMIN_PASSWORD set explicitly in Railway Variables: still wins on every
+#     boot, which is the way back in if you ever lock yourself out.
+if [ -f "$DB_FILE" ]; then
+  if [ -n "${ADMIN_USERNAME:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
+    APPLY_CREDS=1
+    CREDS_NOTE="from Railway Variables"
+  else
+    APPLY_CREDS=0
+    ADMIN_USERNAME="$(read_credential username)"
+    ADMIN_PASSWORD="$(read_credential password)"
+    CREDS_NOTE="kept from the panel database"
+  fi
+else
+  ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+  ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
+  APPLY_CREDS=1
+  if [ "$ADMIN_USERNAME" = admin ] && [ "$ADMIN_PASSWORD" = admin ]; then
+    DEFAULT_CREDS=1
+  fi
+  CREDS_NOTE="seeded on first boot"
+fi
+export ADMIN_USERNAME ADMIN_PASSWORD APPLY_CREDS
 "$XUI_BIN" setting -port "$PANEL_PORT"          >/dev/null
 "$XUI_BIN" setting -webBasePath "$PANEL_PATH"   >/dev/null
 "$XUI_BIN" setting -listenIP 127.0.0.1          >/dev/null
-"$XUI_BIN" setting -username "$ADMIN_USERNAME" -password "$ADMIN_PASSWORD" >/dev/null
-log "panel configured: port ${PANEL_PORT}, base path ${PANEL_PATH}"
+if [ "$APPLY_CREDS" = "1" ]; then
+  "$XUI_BIN" setting -username "$ADMIN_USERNAME" -password "$ADMIN_PASSWORD" >/dev/null
+fi
+log "panel configured: port ${PANEL_PORT}, base path ${PANEL_PATH}; credentials ${CREDS_NOTE}"
 
 # --- 2/3/4. panel + inbound --------------------------------------------------
 start_panel() {
@@ -360,6 +411,20 @@ if [ -s "${RUNTIME_DIR}/bootstrap.env" ]; then
 fi
 
 # --- 5. nginx ----------------------------------------------------------------
+# Bootstrap is skipped on later boots (no stored password to log in with), so
+# read the panel's own subPath from the database rather than assuming /subs/.
+if [ -z "${SUB_REAL_PATH:-}" ]; then
+  SUB_REAL_PATH="$(python3 - <<'PY'
+import sqlite3
+try:
+    con = sqlite3.connect("/etc/x-ui/x-ui.db")
+    row = con.execute("SELECT value FROM settings WHERE key='subPath'").fetchone()
+    print(row[0] if row and row[0] else "/subs/")
+except Exception:
+    print("/subs/")
+PY
+)"
+fi
 SUB_REAL_PATH="${SUB_REAL_PATH:-/subs/}"
 RENDERED="${RUNTIME_DIR}/nginx.conf"
 sed -e "s|@@HTTP_PORT@@|${HTTP_PORT}|g" \
@@ -393,9 +458,13 @@ echo "  3x-ui on Railway — ready"
 echo "=============================================================="
 echo "  Panel          ${PANEL_URL}"
 echo "  Username       ${ADMIN_USERNAME}"
-if [ -n "${GENERATED_PASSWORD:-}" ]; then
-  echo "  Password       ${ADMIN_PASSWORD}   <-- generated, save it now"
-  echo "                 (or set ADMIN_PASSWORD in Railway Variables and redeploy)"
+if [ "$APPLY_CREDS" = "1" ]; then
+  echo "  Password       ${ADMIN_PASSWORD}   (${CREDS_NOTE})"
+fi
+if [ -n "${DEFAULT_CREDS:-}" ]; then
+  echo
+  echo "  !! Still on admin/admin. Change it in Panel Settings -> the change"
+  echo "     sticks across restarts, nothing here overwrites it."
 fi
 echo "  Subscription   ${SUB_URL}"
 echo "                 ^ give every new client subId \"${CLIENT_SUBID}\" and it"
