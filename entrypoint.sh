@@ -558,6 +558,10 @@ if [ -n "${DEFAULT_CREDS:-}" ]; then
   echo "     sticks across restarts, nothing here overwrites it."
 fi
 echo "  Subscription   ${SUB_URL}"
+echo "                 ^ Open it in a browser: it shows the configs as a page."
+echo "                   Paste it into a VPN app: the same address hands the"
+echo "                   app the raw feed. It decides by who is asking, so one"
+echo "                   link does both and you never explain the difference."
 echo "                 ^ give every new client subId \"${CLIENT_SUBID}\" and it"
 echo "                   appears in this same link automatically. No new link,"
 echo "                   no new inbound, nothing to hand out per person."

@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
 """Server-rendered subscription page.
 
-The previous version of this page was static HTML that fetched and decoded the
-subscription in the browser. It rendered blank for at least one real user, and
-nothing in a headless test environment could tell us why. This version does the
-fetch and the base64 decode here, in Python, and serves finished HTML -- so
-`curl` sees exactly what a browser sees, which makes it testable.
+Two problems this file exists to solve.
 
-The one piece of JavaScript left is the copy button, and it is a progressive
-enhancement: with scripting off, the configs are still on the page to select.
+The first version of the page was static HTML that fetched and decoded the
+subscription in the browser. It rendered blank for a real user, and nothing in
+a headless test environment could say why -- curl saw a complete 200. So the
+fetch and the base64 decode happen here, in Python, and finished HTML is
+served: `curl` now sees exactly what a browser sees, which makes it testable.
+
+The second problem is the one that actually produced the blank screen. The
+panel hands out a subscription link of the form /sub/<id>. That endpoint
+belongs to 3x-ui's sub server and answers with raw base64 and a text/plain
+content type. Paste it into a VPN app and it works perfectly; open it in
+Chrome on a phone and there is no HTML to render, so the screen is white.
+Since that is the link every user actually opens, both cases now come here.
+
+So /sub/<id> inspects the client:
+
+  * a VPN client's user agent  -> raw base64, forwarded from the sub server
+  * a browser                  -> the rendered page
+  * ?raw=1                     -> raw base64, whatever is asking
+
+The only JavaScript left is the copy button, a progressive enhancement: with
+scripting off the configs are still on the page to select.
 """
 
 import base64
@@ -27,6 +42,33 @@ PUBLIC_SCHEME = os.environ.get("PUBLIC_SCHEME", "https")
 DEFAULT_SUBID = os.environ.get("CLIENT_SUBID", "mobile")
 BRAND = os.environ.get("BRAND", "CATWOMAN")
 BRAND_URL = os.environ.get("BRAND_URL", "https://t.me/Catwoman_ZaHra")
+
+# User agents that consume the raw feed. Matched case-insensitively as
+# substrings, so "v2rayNG/1.9" and "HiddifyNext/2.1" both hit. Extend with
+# RAW_UA_EXTRA if some client you use arrives with something unusual.
+CLIENT_UA = [
+    "v2ray", "xray", "x-ui", "3x-ui", "sing-box", "singbox", "clash", "mihomo",
+    "stash", "surge", "shadowrocket", "streisand", "nekoray", "nekobox",
+    "hiddify", "v2box", "foxray", "napsternet", "loon", "quantumult", "outline",
+    "vless", "trojan", "wireguard", "tun2socks", "sagernet", "shadowsocks",
+    "husi", "mango", "okhttp", "python-requests", "python-urllib",
+    "curl", "wget", "go-http-client", "dart", "java", "libtorrent",
+]
+_extra = os.environ.get("RAW_UA_EXTRA", "")
+if _extra:
+    CLIENT_UA += [p.strip().lower() for p in _extra.split(",") if p.strip()]
+
+# User agents that are definitely a browser. Used to decide the ambiguous case:
+# a client that sends Accept: */* and a name we do not recognise. Getting this
+# wrong in the other direction is the whole reason this file exists -- a human
+# who lands on raw base64 sees a white screen and has no idea why.
+BROWSER_UA = [
+    "mozilla", "chrome", "safari", "firefox", "edg/", "edge", "opera", "opr/",
+    "samsungbrowser", "crios", "fxios", "chromium", "yaapp", "yabrowser",
+    "ucbrowser", "miuibrowser", "huaweibrowser", "vivobrowser", "oppobrowser",
+    "trident", "gecko", "webkit", "android", "iphone", "ipad", "iemobile",
+]
+
 
 PAGE_CSS = """
 :root { color-scheme: dark; }
@@ -89,8 +131,8 @@ footer a:hover { text-decoration: underline; }
 """
 
 
-def fetch_sub(sub_id):
-    """Return (status, text). text is decoded when the panel sent base64."""
+def fetch_raw(sub_id):
+    """GET the feed from 3x-ui's sub server. Return (status, headers, bytes)."""
     url = "http://127.0.0.1:%d/%s%s" % (
         SUB_PORT,
         os.environ.get("SUB_REAL_PATH", "/subs/").lstrip("/"),
@@ -98,19 +140,46 @@ def fetch_sub(sub_id):
     )
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
-            raw = r.read()
-            status = r.status
+            return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
-        return e.code, ""
+        return e.code, dict(e.headers or {}), b""
     except Exception as e:  # noqa: BLE001 - surfaced to the user on the page
-        return 0, str(e)
+        return 0, {}, str(e).encode("utf-8", "replace")
 
-    body = raw.decode("utf-8", "replace").strip()
+
+def decode_feed(raw_bytes):
+    """The sub server base64-encodes its answer; return the plain lines."""
+    body = raw_bytes.decode("utf-8", "replace").strip()
+    if not body:
+        return []
     try:
-        decoded = base64.b64decode(body, validate=True).decode("utf-8", "replace")
-        return status, decoded
+        return [l.strip() for l in
+                base64.b64decode(body, validate=True).decode("utf-8", "replace").splitlines()
+                if l.strip()]
     except Exception:
-        return status, body
+        return [l.strip() for l in body.splitlines() if l.strip()]
+
+
+def display_form(line):
+    """Human-readable version of a config line, for the page only.
+
+    A share link percent-encodes its remark, so the branded name reaches the
+    page as `CATWOMAN%20%E2%80%A2%20user1`. Correct, and every app decodes it
+    fine, but it is not what a person should have to read. Decode the fragment
+    for display. The copy button still copies the original line verbatim, so
+    nothing that an app consumes is altered.
+    """
+    if "#" not in line:
+        return line
+    link, _, frag = line.rpartition("#")
+    try:
+        pretty = urllib.parse.unquote(frag, errors="strict")
+    except Exception:
+        return line
+    # Only widen it if decoding really did change something readable.
+    if pretty == frag or "%" in pretty:
+        return line
+    return link + "#" + pretty
 
 
 def page(title, body_html):
@@ -160,37 +229,90 @@ COPY_JS = (
 )
 
 
+def wants_raw(headers):
+    """True when the caller is a machine that expects the base64 feed.
+
+    Three signals, in order, because no single one is reliable:
+
+      1. a known client user agent  -> raw
+      2. a known browser user agent -> the page
+      3. otherwise fall back to Accept, and default to the page
+
+    The default matters. A human who lands on raw base64 sees a blank white
+    screen and cannot tell why, while an app that is handed HTML fails loudly
+    and can be fixed by appending ?raw=1. So the safe default is the page.
+    """
+    ua = (headers.get("User-Agent") or "").lower()
+    if any(p in ua for p in CLIENT_UA):
+        return True
+    if any(p in ua for p in BROWSER_UA):
+        return False
+    # Unknown client. Only hand it raw if it explicitly asks for something that
+    # is not a page; a bare */* is not a request for base64.
+    accept = (headers.get("Accept") or "").lower()
+    if not accept or "*/*" in accept:
+        return False
+    return "text/html" not in accept
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "subpage"
     sys_version = ""
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # keep the container log readable
         sys.stderr.write("[subpage] %s\n" % (fmt % args))
 
-    def send_html(self, body, status=200):
-        raw = body.encode("utf-8")
+    def _send(self, status, ctype, raw, extra=None):
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(raw)
 
+    def send_html(self, body, status=200):
+        self._send(status, "text/html; charset=utf-8", body.encode("utf-8"))
+
     def do_GET(self):  # noqa: N802 - required by BaseHTTPRequestHandler
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path.rstrip("/") not in ("/sub", ""):
+        path = parsed.path.rstrip("/")
+        query = urllib.parse.parse_qs(parsed.query)
+        force_raw = bool(query.get("raw"))
+
+        # /sub or /sub/ -> the default id. /sub/<id> -> that id.
+        if path in ("/sub", ""):
+            sub_id = (query.get("id") or [DEFAULT_SUBID])[0].strip() or DEFAULT_SUBID
+        elif path.startswith("/sub/"):
+            sub_id = path[len("/sub/"):]
+        else:
             self.send_html(page("یافت نشد", "<div class=\"card err\">یافت نشد.</div>"), 404)
             return
 
-        query = urllib.parse.parse_qs(parsed.query)
-        sub_id = (query.get("id") or [DEFAULT_SUBID])[0].strip() or DEFAULT_SUBID
-        if len(sub_id) > 64 or "/" in sub_id:
+        if not sub_id or len(sub_id) > 64 or "/" in sub_id or sub_id in (".", ".."):
             self.send_html(page("نامعتبر", "<div class=\"card err\">Sub ID نامعتبر است.</div>"), 400)
             return
 
-        status, text = fetch_sub(sub_id)
-        lines = [l.strip() for l in text.splitlines() if l.strip()] if text else []
+        # A VPN client (or ?raw=1) gets the feed through untouched.
+        if force_raw or wants_raw(self.headers):
+            status, hdrs, raw = fetch_raw(sub_id)
+            if status == 200:
+                # Pass the traffic counters and the update interval along; apps
+                # read those headers for quota display and auto-refresh.
+                keep = {k: v for k, v in hdrs.items()
+                        if k.lower() in ("subscription-userinfo", "profile-update-interval")}
+                self._send(200, "text/plain; charset=utf-8", raw, keep)
+            elif status == 404:
+                self._send(404, "text/plain; charset=utf-8", b"")
+            else:
+                self._send(502, "text/plain; charset=utf-8", b"sub server unreachable")
+            return
+
+        status, _hdrs, raw = fetch_raw(sub_id)
+        lines = decode_feed(raw) if status == 200 else []
 
         public_base = ""
         if PUBLIC_HOST:
@@ -200,11 +322,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if status == 200 and lines:
             parts.append(
-                "<div class=\"card\"><p class=\"count\">%d کانفیگ برای <code>%s</code></p>"
+                "<div class=\"card ok\"><p class=\"count\">%d کانفیگ برای <code>%s</code></p>"
                 % (len(lines), html.escape(sub_id))
             )
             for line in lines:
-                parts.append("<div class=\"cfg\">%s</div>" % html.escape(line))
+                parts.append("<div class=\"cfg\">%s</div>" % html.escape(display_form(line)))
             parts.append(
                 "<div class=\"row\"><button type=\"button\" id=\"cp\" class=\"ghost\">"
                 "کپی همه</button></div>"
@@ -213,6 +335,11 @@ class Handler(BaseHTTPRequestHandler):
                 parts.append(
                     "<p class=\"note sublink\">لینک ساب برای اپ: "
                     "<a href=\"%s\">%s</a></p>"
+                    % (html.escape(public_base, quote=True), html.escape(public_base))
+                )
+                parts.append(
+                    "<p class=\"note\">اگر اپی این لینک را نپذیرفت، نسخه‌ی خام: "
+                    "<a href=\"%s?raw=1\">%s?raw=1</a></p>"
                     % (html.escape(public_base, quote=True), html.escape(public_base))
                 )
             parts.append(
