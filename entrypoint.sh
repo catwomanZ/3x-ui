@@ -50,7 +50,7 @@ SUB_PATH="${SUB_PATH:-/sub/}"
 TUNNEL_PATH="${TUNNEL_PATH:-/ws}"
 TRANSPORT="${TRANSPORT:-ws}"
 CLIENT_EMAIL="${CLIENT_EMAIL:-user1}"
-CLIENT_SUBID="${CLIENT_SUBID:-mobile}"
+CLIENT_SUBID="${CLIENT_SUBID:-CATWOMAN}"
 SUBPAGE_PORT="${SUBPAGE_PORT:-2097}"
 BRAND="${BRAND:-CATWOMAN}"
 # Names the configs exactly as they show up in the client app. {{EMAIL}} is the
@@ -152,7 +152,7 @@ PUBLIC_TLS="${PUBLIC_TLS:-tls}"          # tls | none  (Railway's edge terminate
 TRANSPORT="${TRANSPORT:-ws}"             # ws | xhttp  (ws works in every client)
 TUNNEL_PATH="${TUNNEL_PATH:-/ws}"                 # public path nginx exposes; also the internal path
 CLIENT_EMAIL="${CLIENT_EMAIL:-user1}"
-CLIENT_SUBID="${CLIENT_SUBID:-mobile}"
+CLIENT_SUBID="${CLIENT_SUBID:-CATWOMAN}"
 INBOUND_REMARK="${INBOUND_REMARK:-$BRAND}"
 ADMIN_USERNAME="${ADMIN_USERNAME:?ADMIN_USERNAME is required}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}"
@@ -528,6 +528,35 @@ try:
               f"in {renamed} place(s)")
 except Exception as e:
     print(f"[entrypoint] WARNING: could not rename the old inbound label: {e}")
+PY
+
+# The shared subscription id used to default to "mobile", which is also what the
+# link on everyone's phone says (/sub/mobile). Renaming the default alone would
+# strand every client created before this change: their sub_id would still read
+# "mobile" while the link handed out said "CATWOMAN", so the page would come up
+# empty and the app would report no servers.
+#
+# So move the existing clients across too. Only a sub_id that is exactly the old
+# default is touched -- anyone who put their own subId on a client keeps it.
+python3 - "$CLIENT_SUBID" <<'PY'
+import sqlite3, sys
+want = sys.argv[1]
+OLD = "mobile"
+if want == OLD:
+    sys.exit(0)
+try:
+    con = sqlite3.connect("/etc/x-ui/x-ui.db")
+    rows = con.execute("SELECT email FROM clients WHERE sub_id=?", (OLD,)).fetchall()
+    if rows:
+        con.execute("UPDATE clients SET sub_id=? WHERE sub_id=?", (want, OLD))
+        con.commit()
+        names = ", ".join(r[0] for r in rows)
+        print(f"[entrypoint] moved {len(rows)} client(s) from subId '{OLD}' to "
+              f"'{want}': {names}. The subscription link is now /sub/{want}; "
+              f"the old /sub/{OLD} no longer resolves, so re-add the link on "
+              f"any phone still using it.")
+except Exception as e:
+    print(f"[entrypoint] WARNING: could not move the old subId: {e}")
 PY
 
 # A client whose expiryTime is stored in seconds rather than milliseconds reads

@@ -35,7 +35,7 @@ client ──https──▶ Railway edge (TLS) ──http──▶ nginx :$PORT
 | `ADMIN_PASSWORD` | `admin` (فقط بوت اول) | اگر در Variables بگذاری، در **هر** بوت اعمال می‌شود و رمز عوض‌شده در پنل را بازنویسی می‌کند |
 | `PANEL_PATH` | `/panel/` | مسیر پنل |
 | `SUB_PATH` | `/sub/` | مسیر عمومی ساب‌اسکریپشن |
-| `CLIENT_SUBID` | `mobile` | لینک ساب می‌شود `https://<domain>/sub/<subId>` |
+| `CLIENT_SUBID` | `CATWOMAN` | لینک ساب می‌شود `https://<domain>/sub/<subId>` |
 | `TUNNEL_PATH` | `/ws` | مسیر تونل |
 | `TRANSPORT` | `ws` | `ws` در همه‌ی کلاینت‌ها کار می‌کند؛ `xhttp` مقاوم‌تر است ولی پشتیبانی ضعیف‌تر |
 | `PUBLIC_HOST` | `RAILWAY_PUBLIC_DOMAIN` | دامنه‌ای که داخل لینک‌ها و `subURI` نوشته می‌شود |
@@ -149,19 +149,19 @@ upload=60453; download=102924; total=0; expire=0
 لازم نیست اینباند بسازی یا لینک تازه بدهی. فقط:
 
 1. پنل → **Clients** → **Add Client**
-2. یک **Email** بده (مثلاً `ali`) و در فیلد **Sub ID** دقیقاً `mobile` را بنویس
+2. یک **Email** بده (مثلاً `ali`) و در فیلد **Sub ID** دقیقاً `CATWOMAN` را بنویس
    (همان `CLIENT_SUBID` پیش‌فرض)
 3. ذخیره
 
 تمام. کانفیگ او خودش به همان لینک ساب اضافه می‌شود:
 
 ```
-https://<دامنه>/sub/mobile
+https://<دامنه>/sub/CATWOMAN
 ```
 
 هر کسی آن لینک را در v2rayNG / Streisand وارد کند، **همه‌ی** کانفیگ‌هایی که
-`subId=mobile` دارند را یک‌جا می‌گیرد. این با تست تأیید شده: با دو کلاینت که
-subId مشترک داشتند، `/sub/mobile` هر دو لینک `vless://` را برگرداند.
+`subId=CATWOMAN` دارند را یک‌جا می‌گیرد. این با تست تأیید شده: با دو کلاینت که
+subId مشترک داشتند، `/sub/CATWOMAN` هر دو لینک `vless://` را برگرداند.
 
 اگر به یک نفر لینک اختصاصی می‌خواهی، Sub ID متفاوت بده — آن‌وقت لینکش
 `https://<دامنه>/sub/<همان subId>` می‌شود. مسیر `/sub/` برای هر subId کار
@@ -188,7 +188,7 @@ subId مشترک داشتند، `/sub/mobile` هر دو لینک `vless://` را
 | `bash -n entrypoint.sh` | بدون خطا |
 | `/healthz` | `200 ok` |
 | صفحه‌ی ورود پنل + فایل JS آن | `200` / `200` |
-| `/sub/mobile` | base64 معتبر، دکد می‌شود به لینک `vless://` |
+| `/sub/CATWOMAN` | base64 معتبر، دکد می‌شود به لینک `vless://` |
 | هندشیک WebSocket روی `/ws` از طریق nginx | `101 Switching Protocols` |
 | `/` برای اسکنرها | `404` |
 | اینباند Xray در `bin/config.json` | `vless/ws` روی ۱۰۰۸۵، مسیر `/ws`، کلاینت `user1` |

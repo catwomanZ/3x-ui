@@ -28,7 +28,7 @@ PORT = int(os.environ.get("SUBPAGE_PORT", "2097"))
 SUB_PORT = int(os.environ.get("SUB_PORT", "2096"))
 SUB_REAL_PATH = os.environ.get("SUB_REAL_PATH", "/subs/")
 PUBLIC_PATH = os.environ.get("SUB_PATH", "/sub/")
-DEFAULT_SUBID = os.environ.get("CLIENT_SUBID", "mobile")
+DEFAULT_SUBID = os.environ.get("CLIENT_SUBID", "CATWOMAN")
 
 # User agents that are plainly a browser. Used only to decide whether to ask
 # for the HTML page when Accept is too vague to tell.
@@ -74,7 +74,7 @@ def has_quota(ui):
 def to_upstream(path):
     """Map the public /sub/... path onto the sub server's own random path.
 
-    /sub/mobile      -> /<subPath>mobile
+    /sub/CATWOMAN    -> /<subPath>CATWOMAN
     /sub or /sub/    -> /<subPath><default id>
     /sub/whatever/x  -> /<subPath>whatever/x
 
