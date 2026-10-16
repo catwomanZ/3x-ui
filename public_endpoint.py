@@ -7,8 +7,10 @@ Railway exposes none of Xray's internal ports; every public config must use the 
 host on port 443 with TLS, SNI, WebSocket Host and path all aligned.
 
 Only an inbound on ``inbound_port`` that is identifiable by the ``brand``
-remark (on the inbound or one of its Hosts) is managed. Custom Hosts and
-externalProxy entries created in the panel are deliberately left alone.
+remark (on the inbound or one of its Hosts) is managed. Custom Hosts are left
+alone. The generated brand Host follows Railway domain changes only while it
+still matches the exact automatic baseline; editing it in the panel transfers
+ownership to the operator, so later panel/sub requests cannot undo the Save.
 """
 
 from __future__ import annotations
@@ -32,10 +34,65 @@ class SyncResult:
     inbounds: int = 0
     hosts: int = 0
     hosts_created: int = 0
+    hosts_preserved: int = 0
 
     @property
     def changed(self) -> int:
         return self.settings + self.inbounds + self.hosts + self.hosts_created
+
+
+# This marker records the exact values last written by the automatic Railway
+# synchronizer. If the panel later stores different values, that difference is
+# an operator edit and must win. Keeping the marker in SQLite makes the choice
+# survive both panel requests and container restarts (when /etc/x-ui is a
+# Railway Volume).
+HOST_STATE_KEY = "catwomanManagedHostStateV1"
+
+
+def _load_host_state(con: sqlite3.Connection) -> dict:
+    row = con.execute("SELECT value FROM settings WHERE key=?", (HOST_STATE_KEY,)).fetchone()
+    if not row or not row[0]:
+        return {"version": 1, "inbounds": {}}
+    try:
+        state = json.loads(row[0])
+    except (TypeError, ValueError):
+        return {"version": 1, "inbounds": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("inbounds"), dict):
+        return {"version": 1, "inbounds": {}}
+    return state
+
+
+def _host_signature(row: tuple) -> dict:
+    """Return only fields the Railway synchronizer is allowed to own."""
+    return {
+        "address": row[3] or "",
+        "port": int(row[4] or 0),
+        "security": row[5] or "",
+        "sni": row[6] or "",
+        "hostHeader": row[7] or "",
+        "path": row[8] or "",
+        "allowInsecure": bool(row[9]),
+        "isDisabled": bool(row[10]),
+        "isHidden": bool(row[11]),
+        "overrideSniFromAddress": bool(row[12]),
+        "keepSniBlank": bool(row[13]),
+    }
+
+
+def _desired_host_signature(host: str, port: int, security: str, path: str) -> dict:
+    return {
+        "address": host,
+        "port": int(port),
+        "security": security,
+        "sni": host,
+        "hostHeader": host,
+        "path": path,
+        "allowInsecure": False,
+        "isDisabled": False,
+        "isHidden": False,
+        "overrideSniFromAddress": False,
+        "keepSniBlank": False,
+    }
 
 
 def normalize_public_host(value: str | None) -> str | None:
@@ -186,59 +243,86 @@ def sync_public_endpoint(
                 con, key, f"https://{host}{path}"
             )
 
-        inbound_ids: list[int] = []
         rows = con.execute(
             "SELECT i.id, i.stream_settings FROM inbounds i "
             "WHERE i.port=? AND (i.remark=? OR EXISTS ("
             "SELECT 1 FROM hosts h WHERE h.inbound_id=i.id AND h.remark=?))",
             (int(inbound_port), brand, brand),
         ).fetchall()
-        for inbound_id, raw in rows:
-            inbound_ids.append(inbound_id)
-            cooked, changed = _managed_stream(
-                raw, host, public_port, security, brand, tunnel_path
-            )
-            if changed:
-                con.execute(
-                    "UPDATE inbounds SET stream_settings=? WHERE id=?",
-                    (cooked, inbound_id),
-                )
-                result.inbounds += 1
-
+        host_state = _load_host_state(con)
+        inbound_states = host_state.setdefault("inbounds", {})
         now_ms = int(time.time() * 1000)
-        for inbound_id in inbound_ids:
+        desired_signature = _desired_host_signature(
+            host, public_port, security, tunnel_path
+        )
+
+        for inbound_id, raw in rows:
             host_rows = con.execute(
-                "SELECT id, remark, address, port, security, sni, "
-                "host_header, path, allow_insecure, is_disabled, is_hidden "
+                "SELECT id, group_id, remark, address, port, security, sni, "
+                "host_header, path, allow_insecure, is_disabled, is_hidden, "
+                "override_sni_from_address, keep_sni_blank "
                 "FROM hosts WHERE inbound_id=? ORDER BY id",
                 (inbound_id,),
             ).fetchall()
-            managed_rows = [row for row in host_rows if row[1] == brand]
+            managed_rows = [row for row in host_rows if row[2] == brand]
+            state_key = str(inbound_id)
+            saved = inbound_states.get(state_key)
+            automatic = False
 
             if managed_rows:
                 # Exactly one row owns the reserved brand. Retain the oldest
                 # one and remove only same-brand duplicates; custom rows are
                 # never candidates for deletion.
                 row = managed_rows[0]
-                desired = (
-                    host, public_port, security, host,
-                    host, tunnel_path, 0, 0, 0,
-                )
-                current = row[2:]
-                try:
-                    current = (current[0], int(current[1]), *current[2:])
-                except (TypeError, ValueError):
-                    pass
-                if current != desired:
-                    con.execute(
-                        "UPDATE hosts SET address=?, port=?, security=?, sni=?, "
-                        "host_header=?, path=?, allow_insecure=0, "
-                        "is_disabled=0, is_hidden=0, "
-                        "override_sni_from_address=0, keep_sni_blank=0, "
-                        "updated_at=? WHERE id=?",
-                        (*desired[:6], now_ms, row[0]),
+                group_id = row[1]
+                current_signature = _host_signature(row)
+
+                # A row is automatic only while it still equals the exact
+                # baseline last written by us. A successful Hosts-page edit
+                # changes that signature, so it becomes operator-owned and is
+                # never replaced by the next panel/sub request.
+                if (
+                    isinstance(saved, dict)
+                    and saved.get("groupId") == group_id
+                ):
+                    automatic = (
+                        saved.get("mode") == "auto"
+                        and saved.get("signature") == current_signature
                     )
-                    result.hosts += 1
+                elif saved is None:
+                    # Upgrade path from releases that did not persist a marker:
+                    # the reserved CATWOMAN row was always wrapper-owned in
+                    # those versions, so repair it once and establish a precise
+                    # baseline before an operator can open the Hosts page.
+                    automatic = True
+
+                if automatic:
+                    if current_signature != desired_signature:
+                        con.execute(
+                            "UPDATE hosts SET address=?, port=?, security=?, sni=?, "
+                            "host_header=?, path=?, allow_insecure=0, "
+                            "is_disabled=0, is_hidden=0, "
+                            "override_sni_from_address=0, keep_sni_blank=0, "
+                            "updated_at=? WHERE id=?",
+                            (
+                                host, public_port, security, host, host,
+                                tunnel_path, now_ms, row[0],
+                            ),
+                        )
+                        result.hosts += 1
+                    inbound_states[state_key] = {
+                        "groupId": group_id,
+                        "mode": "auto",
+                        "signature": desired_signature,
+                    }
+                else:
+                    inbound_states[state_key] = {
+                        "groupId": group_id,
+                        "mode": "manual",
+                        "signature": current_signature,
+                    }
+                    result.hosts_preserved += 1
+
                 duplicate_ids = [duplicate[0] for duplicate in managed_rows[1:]]
                 if duplicate_ids:
                     marks = ",".join("?" for _ in duplicate_ids)
@@ -247,21 +331,51 @@ def sync_public_endpoint(
                         duplicate_ids,
                     )
                     result.hosts += len(duplicate_ids)
-
-            # A fresh API-created inbound normally gets a Host automatically.
-            # If it is missing, add one without changing any custom Host rows.
-            if not managed_rows:
+            else:
+                # A fresh API-created inbound normally gets a Host
+                # automatically. If it is missing, add one without changing
+                # any custom Host rows.
+                group_id = _group_id()
                 con.execute(
                     "INSERT INTO hosts (group_id,inbound_id,sort_order,remark,"
                     "is_disabled,is_hidden,address,port,security,sni,host_header,"
                     "path,override_sni_from_address,keep_sni_blank,allow_insecure,"
                     "created_at,updated_at) VALUES (?,?,0,?,0,0,?,?,?,?,?,? ,0,0,0,?,?)",
                     (
-                        _group_id(), inbound_id, brand, host, public_port,
+                        group_id, inbound_id, brand, host, public_port,
                         security, host, host, tunnel_path, now_ms, now_ms,
                     ),
                 )
                 result.hosts_created += 1
+                automatic = True
+                inbound_states[state_key] = {
+                    "groupId": group_id,
+                    "mode": "auto",
+                    "signature": desired_signature,
+                }
+
+            # Keep the legacy direct-link projection synchronized only while
+            # the CATWOMAN Host remains automatic. Once the operator edits that
+            # Host, both the normalized row and the legacy projection are left
+            # under panel control.
+            if automatic:
+                cooked, changed = _managed_stream(
+                    raw, host, public_port, security, brand, tunnel_path
+                )
+                if changed:
+                    con.execute(
+                        "UPDATE inbounds SET stream_settings=? WHERE id=?",
+                        (cooked, inbound_id),
+                    )
+                    result.inbounds += 1
+
+        if rows:
+            result.settings += _upsert_setting(
+                con,
+                HOST_STATE_KEY,
+                json.dumps(host_state, ensure_ascii=False,
+                           sort_keys=True, separators=(",", ":")),
+            )
 
         con.commit()
         return result
@@ -295,13 +409,15 @@ def main() -> int:
     )
     print(
         "[public-endpoint] https://%s:443 synchronized "
-        "(settings=%d, inbounds=%d, hosts=%d, hosts_created=%d)"
+        "(settings=%d, inbounds=%d, hosts=%d, hosts_created=%d, "
+        "hosts_preserved=%d)"
         % (
             result.host,
             result.settings,
             result.inbounds,
             result.hosts,
             result.hosts_created,
+            result.hosts_preserved,
         )
     )
     return 0

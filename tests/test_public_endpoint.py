@@ -8,7 +8,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from public_endpoint import normalize_public_host, sync_public_endpoint  # noqa: E402
+from public_endpoint import (  # noqa: E402
+    HOST_STATE_KEY,
+    normalize_public_host,
+    sync_public_endpoint,
+)
 
 
 class PublicEndpointTest(unittest.TestCase):
@@ -180,6 +184,92 @@ class PublicEndpointTest(unittest.TestCase):
             sync_public_endpoint(self.db, "new-cat.up.railway.app").changed,
             0,
         )
+
+    def test_panel_edit_of_managed_host_is_preserved_across_requests(self):
+        # The first request after upgrading repairs the old wrapper-owned row
+        # and records the exact automatic baseline.
+        sync_public_endpoint(self.db, "new-cat.up.railway.app")
+        con = sqlite3.connect(self.db)
+        state = json.loads(con.execute(
+            "SELECT value FROM settings WHERE key=?", (HOST_STATE_KEY,)
+        ).fetchone()[0])
+        self.assertEqual(state["inbounds"]["1"]["mode"], "auto")
+
+        # This is the database result of a successful Save in 3x-ui's Hosts
+        # page. The next nginx auth subrequest must detect, not undo, it.
+        con.execute(
+            "UPDATE hosts SET address='manual.cdn.example',port=8443,"
+            "security='tls',sni='manual.sni.example',"
+            "host_header='manual.host.example',path='/manual-saved' "
+            "WHERE group_id='managed'"
+        )
+        con.commit()
+        con.close()
+
+        result = sync_public_endpoint(self.db, "changed-cat.up.railway.app")
+        self.assertEqual(result.hosts_preserved, 1)
+        con = sqlite3.connect(self.db)
+        self.assertEqual(
+            con.execute(
+                "SELECT address,port,security,sni,host_header,path FROM hosts "
+                "WHERE group_id='managed'"
+            ).fetchone(),
+            ("manual.cdn.example", 8443, "tls", "manual.sni.example",
+             "manual.host.example", "/manual-saved"),
+        )
+        state = json.loads(con.execute(
+            "SELECT value FROM settings WHERE key=?", (HOST_STATE_KEY,)
+        ).fetchone()[0])
+        self.assertEqual(state["inbounds"]["1"]["mode"], "manual")
+        con.close()
+
+        # The ownership decision is persisted in SQLite, so later requests and
+        # container restarts keep the panel edit even if the Railway host seen
+        # by the wrapper changes again.
+        sync_public_endpoint(self.db, "third-cat.up.railway.app")
+        con = sqlite3.connect(self.db)
+        self.assertEqual(
+            con.execute(
+                "SELECT address,host_header,path FROM hosts "
+                "WHERE group_id='managed'"
+            ).fetchone(),
+            ("manual.cdn.example", "manual.host.example", "/manual-saved"),
+        )
+        con.close()
+
+    def test_deleting_manual_managed_host_restores_automatic_mode(self):
+        sync_public_endpoint(self.db, "new-cat.up.railway.app")
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE hosts SET host_header='manual.host.example' "
+            "WHERE group_id='managed'"
+        )
+        con.commit()
+        con.close()
+        sync_public_endpoint(self.db, "new-cat.up.railway.app")
+
+        con = sqlite3.connect(self.db)
+        con.execute("DELETE FROM hosts WHERE group_id='managed'")
+        con.commit()
+        con.close()
+        result = sync_public_endpoint(self.db, "restored-cat.up.railway.app")
+        self.assertEqual(result.hosts_created, 1)
+
+        con = sqlite3.connect(self.db)
+        row = con.execute(
+            "SELECT address,port,security,sni,host_header,path FROM hosts "
+            "WHERE inbound_id=1 AND remark='CATWOMAN'"
+        ).fetchone()
+        state = json.loads(con.execute(
+            "SELECT value FROM settings WHERE key=?", (HOST_STATE_KEY,)
+        ).fetchone()[0])
+        con.close()
+        self.assertEqual(
+            row,
+            ("restored-cat.up.railway.app", 443, "tls",
+             "restored-cat.up.railway.app", "restored-cat.up.railway.app", "/ws"),
+        )
+        self.assertEqual(state["inbounds"]["1"]["mode"], "auto")
 
     def test_public_edge_cannot_be_downgraded(self):
         with self.assertRaises(ValueError):
