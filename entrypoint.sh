@@ -5,12 +5,11 @@
 #   1. Configure the panel through its CLI *before* it ever starts. The CLI
 #      writes straight to /etc/x-ui/x-ui.db, so there is no reload to wait for.
 #   2. Start the panel. It spawns Xray from bin/config.json.
-#   3. Create the inbound through the HTTP API. This writes to the database but
-#      does NOT reliably regenerate bin/config.json, so Xray keeps running the
-#      config it booted with.
-#   4. Therefore: if step 3 created or changed anything, restart the panel once
-#      so Xray is relaunched with the inbound present. Bootstrap is idempotent,
-#      so the second pass finds the inbound, changes nothing and stops looping.
+#   3. Create the inbound through the HTTP API only when it does not exist.
+#      Existing inbounds are never replaced with a canned payload, because that
+#      would erase operator-created clients and transport options.
+#   4. A newly-created inbound does not reliably regenerate bin/config.json, so
+#      restart the panel once only in that case; Xray then sees the new inbound.
 #   5. Render nginx and supervise both processes.
 #
 # If either process dies the container exits and Railway restarts it.
@@ -41,12 +40,14 @@ export RUNTIME_DIR
 # expired when it is not. Default to the operator's zone; override with TZ.
 export TZ="${TZ:-Asia/Tehran}"
 
-HTTP_PORT="${HTTP_PORT:-${PORT:-8080}}"     # Railway injects PORT
+HTTP_PORT="${PORT:-${HTTP_PORT:-8080}}"     # Railway's routed PORT always wins
 PANEL_PORT="${PANEL_PORT:-2053}"
 SUB_PORT="${SUB_PORT:-2096}"
 INBOUND_PORT="${INBOUND_PORT:-10085}"
 PANEL_PATH="${PANEL_PATH:-/panel/}"
 SUB_PATH="${SUB_PATH:-/sub/}"
+SUB_JSON_PATH="${SUB_JSON_PATH:-/sub-json/}"
+SUB_CLASH_PATH="${SUB_CLASH_PATH:-/sub-clash/}"
 TUNNEL_PATH="${TUNNEL_PATH:-/ws}"
 TRANSPORT="${TRANSPORT:-ws}"
 CLIENT_EMAIL="${CLIENT_EMAIL:-user1}"
@@ -78,8 +79,19 @@ case "$SUB_PATH" in
   /*) SUB_PATH="${SUB_PATH}/" ;;
   *)  SUB_PATH="/${SUB_PATH}/" ;;
 esac
+case "$SUB_JSON_PATH" in
+  /*/) ;;
+  /*) SUB_JSON_PATH="${SUB_JSON_PATH}/" ;;
+  *)  SUB_JSON_PATH="/${SUB_JSON_PATH}/" ;;
+esac
+case "$SUB_CLASH_PATH" in
+  /*/) ;;
+  /*) SUB_CLASH_PATH="${SUB_CLASH_PATH}/" ;;
+  *)  SUB_CLASH_PATH="/${SUB_CLASH_PATH}/" ;;
+esac
 
-  export PANEL_PATH SUB_PATH TUNNEL_PATH HTTP_PORT PANEL_PORT SUB_PORT INBOUND_PORT
+  export PANEL_PATH SUB_PATH SUB_JSON_PATH SUB_CLASH_PATH TUNNEL_PATH
+  export HTTP_PORT PANEL_PORT SUB_PORT INBOUND_PORT
   export TRANSPORT CLIENT_EMAIL CLIENT_SUBID
   # BRAND is read inside bootstrap.sh (the inbound gets named after it), and
   # bootstrap.sh runs under `set -u`, so it has to be exported -- an unexported
@@ -87,13 +99,26 @@ esac
   export BRAND REMARK_TEMPLATE
   export PANEL_PORT INBOUND_PORT
 
-# The public hostname is what every generated link contains. Railway only
-# injects RAILWAY_PUBLIC_DOMAIN *after* you press "Generate Domain", and it
-# appears on the following deploy — so the first boot of a fresh service cannot
-# know it. Set PUBLIC_HOST yourself to skip that round trip.
-PUBLIC_HOST="${PUBLIC_HOST:-${RAILWAY_PUBLIC_DOMAIN:-}}"
-PUBLIC_PORT="${PUBLIC_PORT:-443}"
-PUBLIC_TLS="${PUBLIC_TLS:-tls}"
+# Every public config must describe Railway's edge, never Xray's internal
+# listener. The platform domain wins over a stale manually-entered value, and
+# the public endpoint is always HTTPS on 443 even though the container itself
+# receives plain HTTP from Railway.
+PUBLIC_HOST="${RAILWAY_PUBLIC_DOMAIN:-${PUBLIC_HOST:-}}"
+if [ -n "$PUBLIC_HOST" ]; then
+  RAW_PUBLIC_HOST="$PUBLIC_HOST"
+  PUBLIC_HOST="$(PYTHONPATH=/opt python3 - "$RAW_PUBLIC_HOST" <<'PY'
+import sys
+from public_endpoint import normalize_public_host
+print(normalize_public_host(sys.argv[1]) or "")
+PY
+)"
+  if [ -z "$PUBLIC_HOST" ]; then
+    printf '[entrypoint] WARNING: ignoring invalid public hostname %q; a real request can repair it\n' \
+      "$RAW_PUBLIC_HOST"
+  fi
+fi
+PUBLIC_PORT=443
+PUBLIC_TLS=tls
 export PUBLIC_HOST PUBLIC_PORT PUBLIC_TLS
 
 log() { printf '[entrypoint] %s\n' "$*"; }
@@ -130,8 +155,9 @@ write_bootstrap() {
 # Bootstraps the panel and one ready-to-use inbound, talking to the panel's own
 # HTTP API. Runs once per boot; it is idempotent, so a second boot is a no-op.
 #
-# Everything here was derived by probing 3x-ui v3.9.0 directly, because two of
-# its behaviours are not what the existing templates assume:
+# The API flow below is integration-tested against 3x-ui v3.10.2 (and retained
+# compatibility with a v3.9.0 database), because two behaviours are easy to
+# misread from older templates:
 #
 #   1. The API base is "<webBasePath>panel/api/". With PANEL_PATH=/panel/ that
 #      reads /panel/panel/api/... and looks like a typo. With /abc/ it is
@@ -146,9 +172,12 @@ set -euo pipefail
 PANEL_PATH="${PANEL_PATH:-/panel/}"
 PANEL_PORT="${PANEL_PORT:-2053}"
 INBOUND_PORT="${INBOUND_PORT:-10085}"
+SUB_PATH="${SUB_PATH:-/sub/}"
+SUB_JSON_PATH="${SUB_JSON_PATH:-/sub-json/}"
+SUB_CLASH_PATH="${SUB_CLASH_PATH:-/sub-clash/}"
 PUBLIC_HOST="${PUBLIC_HOST:-}"
-PUBLIC_PORT="${PUBLIC_PORT:-443}"
-PUBLIC_TLS="${PUBLIC_TLS:-tls}"          # tls | none  (Railway's edge terminates TLS -> the link must say tls)
+PUBLIC_PORT=443
+PUBLIC_TLS=tls                            # Railway's edge terminates TLS
 TRANSPORT="${TRANSPORT:-ws}"             # ws | xhttp  (ws works in every client)
 TUNNEL_PATH="${TUNNEL_PATH:-/ws}"                 # public path nginx exposes; also the internal path
 CLIENT_EMAIL="${CLIENT_EMAIL:-user1}"
@@ -216,6 +245,15 @@ api_post() {
 # --- inbound -----------------------------------------------------------------
 EXISTING="$(api_get /inbounds/list | jq -c '[.obj[]? | select(.port == '"${INBOUND_PORT}"')]')"
 COUNT="$(echo "$EXISTING" | jq 'length')"
+if [ "$COUNT" -gt 1 ]; then
+  die "more than one inbound uses internal port ${INBOUND_PORT}; refusing to guess which one is managed"
+fi
+if [ "$COUNT" -eq 1 ]; then
+  EXISTING_REMARK="$(echo "$EXISTING" | jq -r '.[0].remark // empty')"
+  if [ "$EXISTING_REMARK" != "$INBOUND_REMARK" ]; then
+    die "port ${INBOUND_PORT} belongs to inbound '${EXISTING_REMARK}', not '${INBOUND_REMARK}'; preserving it without changes"
+  fi
+fi
 
 UUID="$(cat /proc/sys/kernel/random/uuid)"
 if [ "$COUNT" -gt 0 ]; then
@@ -304,16 +342,20 @@ print(json.dumps({
 PY
 
 if [ "$COUNT" -gt 0 ]; then
-  ID="$(echo "$EXISTING" | jq -r '.[0].id')"
-  RESP="$(api_post "/inbounds/update/${ID}" "$PAYLOAD")"
-  VERB="updated"
+  # Never PUT a canned one-client payload over an existing inbound. Doing that
+  # would silently delete every client and transport option the operator added
+  # in the panel. Public endpoint repair is handled selectively before startup.
+  VERB="reused"
+  rm -f "$PAYLOAD"
+  log "existing inbound preserved on internal port ${INBOUND_PORT}"
 else
   RESP="$(api_post /inbounds/add "$PAYLOAD")"
+  echo "$RESP" | jq -e '.success == true' >/dev/null \
+    || die "inbound creation failed: ${RESP}"
+  rm -f "$PAYLOAD"
   VERB="created"
+  log "inbound created: vless/${TRANSPORT} on internal port ${INBOUND_PORT}, path ${TUNNEL_PATH}"
 fi
-echo "$RESP" | jq -e '.success == true' >/dev/null || die "inbound ${VERB} failed: ${RESP}"
-rm -f "$PAYLOAD"
-log "inbound ${VERB}: vless/${TRANSPORT} on internal port ${INBOUND_PORT}, path ${TUNNEL_PATH}"
 
 # --- subscription path -------------------------------------------------------
 # The panel generates a random subPath and serves it on its own port. nginx
@@ -337,33 +379,39 @@ log "panel subscription path is ${SUB_REAL_PATH}"
 # page from subDomain and subPort, which gives
 # http://<domain>:2096<subPath><subId>. Railway exposes exactly one public port
 # over HTTPS, so that link can never be reached from a browser or an app.
-# subURI overrides it. Only fill in the broken defaults -- a custom domain the
-# admin typed by hand is left alone.
+# The three public URI overrides cover raw, JSON and Clash subscriptions. Never
+# retain a previous domain or expose any internal random path and :2096.
 if [ -n "$PUBLIC_HOST" ]; then
-  python3 - "$PUBLIC_HOST" "$SUB_PATH" <<'PY'
+  python3 - "$PUBLIC_HOST" "$SUB_PATH" "$SUB_JSON_PATH" "$SUB_CLASH_PATH" <<'PY'
 import sqlite3, sys
-host, sub_path = sys.argv[1], sys.argv[2]
-want = f"https://{host}{sub_path}"
+host = sys.argv[1]
+values = {
+    "subURI": f"https://{host}{sys.argv[2]}",
+    "subJsonURI": f"https://{host}{sys.argv[3]}",
+    "subClashURI": f"https://{host}{sys.argv[4]}",
+}
 db = "/etc/x-ui/x-ui.db"
 try:
     con = sqlite3.connect(db)
-    row = con.execute("SELECT value FROM settings WHERE key='subURI'").fetchone()
-    cur = row[0] if row else ""
-    if cur and ":2096" not in cur and not cur.startswith("http://"):
-        print(f"[bootstrap] subURI already set to {cur}; leaving it alone")
-    else:
+    changed = []
+    for key, want in values.items():
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        cur = row[0] if row else ""
+        if cur == want:
+            continue
         if row:
-            con.execute("UPDATE settings SET value=? WHERE key='subURI'", (want,))
+            con.execute("UPDATE settings SET value=? WHERE key=?", (want, key))
         else:
-            con.execute("INSERT INTO settings(key,value) VALUES('subURI',?)", (want,))
+            con.execute("INSERT INTO settings(key,value) VALUES(?,?)", (key, want))
+        changed.append(f"{key}={want}")
+    if changed:
         con.commit()
-        print(f"[bootstrap] subURI set to {want}")
+        print("[bootstrap] public subscription URIs set: " + ", ".join(changed))
 except Exception as e:
-    print(f"[bootstrap] WARNING: could not set subURI: {e}")
+    print(f"[bootstrap] WARNING: could not set public subscription URIs: {e}")
 PY
 else
-  log "PUBLIC_HOST is empty; not setting subURI, so the panel will show a :2096 link"
-  log "set PUBLIC_HOST in Railway Variables (or Generate Domain then Redeploy)"
+  log "public host is not available during bootstrap; the first public panel/sub request will set subURI"
 fi
 
 # --- report ------------------------------------------------------------------
@@ -381,7 +429,15 @@ LINKS="$(api_get /inbounds/allLinks | jq -r '.obj[]?' | head -1 || true)"
   printf 'SUB_REAL_PATH=%s\n'  "$(shell_quote "$SUB_REAL_PATH")"
   printf 'CLIENT_UUID=%s\n'    "$(shell_quote "$UUID")"
   printf 'INBOUND_VERB=%s\n'   "$(shell_quote "$VERB")"
-  if [ -n "$LINKS" ]; then
+  if [ "$VERB" = "created" ]; then
+    printf 'INBOUND_CHANGED=1\n'
+  else
+    printf 'INBOUND_CHANGED=0\n'
+  fi
+  # With no domain yet, 3x-ui's temporary direct link is localhost:10085.
+  # Never print or hand that internal bootstrap value to the operator; the
+  # first public request will create a correct HTTPS/443 link instead.
+  if [ -n "$PUBLIC_HOST" ] && [ -n "$LINKS" ]; then
     printf 'CLIENT_LINK=%s\n'  "$(shell_quote "$LINKS")"
   fi
 } > "${RUNTIME_DIR}/bootstrap.env"
@@ -400,18 +456,31 @@ mkdir -p /etc/x-ui /var/log/x-ui
 #
 #   * no database yet (first boot, empty Volume): seed admin/admin so the
 #     service is usable with zero Variables.
-#   * database exists: leave the credentials alone, so what you set in
-#     Panel Settings survives restarts and redeploys.
-#   * ADMIN_PASSWORD set explicitly in Railway Variables: still wins on every
-#     boot, which is the way back in if you ever lock yourself out.
-if [ -f "$DB_FILE" ]; then
-  if [ -n "${ADMIN_USERNAME:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
+#   * a valid database user exists: leave it alone, so what you set in Panel
+#     Settings survives restarts and redeploys.
+#   * ADMIN_PASSWORD set explicitly in Railway Variables: wins on every boot
+#     (ADMIN_USERNAME is optional and defaults to the stored username). This is
+#     the way back in if you ever lock yourself out.
+#   * an empty/partial database file is treated like a first boot instead of
+#     trapping the service with an empty username and no usable password.
+STORED_USERNAME=""
+STORED_PASSWORD=""
+if [ -s "$DB_FILE" ]; then
+  STORED_USERNAME="$(read_credential username)"
+  STORED_PASSWORD="$(read_credential password)"
+fi
+if [ -n "$STORED_USERNAME" ] && [ -n "$STORED_PASSWORD" ]; then
+  if [ -n "${ADMIN_PASSWORD:-}" ]; then
+    ADMIN_USERNAME="${ADMIN_USERNAME:-$STORED_USERNAME}"
     APPLY_CREDS=1
     CREDS_NOTE="from Railway Variables"
   else
+    if [ -n "${ADMIN_USERNAME:-}" ] && [ "$ADMIN_USERNAME" != "$STORED_USERNAME" ]; then
+      log "WARNING: ADMIN_USERNAME without ADMIN_PASSWORD cannot update credentials; keeping the stored username"
+    fi
     APPLY_CREDS=0
-    ADMIN_USERNAME="$(read_credential username)"
-    ADMIN_PASSWORD="$(read_credential password)"
+    ADMIN_USERNAME="$STORED_USERNAME"
+    ADMIN_PASSWORD="$STORED_PASSWORD"
     CREDS_NOTE="kept from the panel database"
   fi
 else
@@ -490,15 +559,18 @@ PY
 # their inbound would keep the old label for ever. So rename it here instead,
 # unconditionally and idempotently, before the panel reads the table.
 #
-# Only a stored value that is exactly the old default is touched. A name you
-# typed yourself in the panel is yours and survives every restart.
-python3 - "$BRAND" <<'PY'
+# Only the managed internal port and a value exactly equal to the old default
+# are touched. Other inbounds and names typed in the panel survive every boot.
+python3 - "$BRAND" "$INBOUND_PORT" <<'PY'
 import json, sqlite3, sys
-brand = sys.argv[1]
+brand, inbound_port = sys.argv[1], int(sys.argv[2])
 OLD = "railway"
 try:
     con = sqlite3.connect("/etc/x-ui/x-ui.db")
-    rows = con.execute("SELECT id, remark, stream_settings FROM inbounds").fetchall()
+    rows = con.execute(
+        "SELECT id, remark, stream_settings FROM inbounds WHERE port=?",
+        (inbound_port,),
+    ).fetchall()
     renamed = 0
     for iid, remark, ss in rows:
         if remark == OLD:
@@ -522,6 +594,15 @@ try:
                     con.execute("UPDATE inbounds SET stream_settings=? WHERE id=?",
                                 (json.dumps(obj, ensure_ascii=False), iid))
                     renamed += 1
+    # v3.10 migrated each legacy externalProxy into its own Hosts row. Keep the
+    # managed row recognisable so the public-endpoint synchronizer can update it
+    # without ever touching Hosts the operator added by hand.
+    changed = con.execute(
+        "UPDATE hosts SET remark=? WHERE remark=? AND inbound_id IN "
+        "(SELECT id FROM inbounds WHERE port=?)",
+        (brand, OLD, inbound_port),
+    ).rowcount
+    renamed += max(changed, 0)
     if renamed:
         con.commit()
         print(f"[entrypoint] renamed the old '{OLD}' label to '{brand}' "
@@ -529,6 +610,26 @@ try:
 except Exception as e:
     print(f"[entrypoint] WARNING: could not rename the old inbound label: {e}")
 PY
+
+# Keep the managed Railway endpoint complete even when the stored admin password
+# is a bcrypt hash and the bootstrap cannot log in. v3.10 generates subscription
+# links from the Hosts table, while direct share links can still read the legacy
+# externalProxy/stream settings; the helper updates both plus all public
+# subscription URIs atomically. Other inbounds and custom Hosts stay untouched.
+if [ -n "$PUBLIC_HOST" ]; then
+  if ! python3 /opt/public_endpoint.py "$PUBLIC_HOST" \
+      --db "$DB_FILE" \
+      --inbound-port "$INBOUND_PORT" \
+      --brand "$BRAND" \
+      --sub-path "$SUB_PATH" \
+      --sub-json-path "$SUB_JSON_PATH" \
+      --sub-clash-path "$SUB_CLASH_PATH" \
+      --tunnel-path "$TUNNEL_PATH"; then
+    log "WARNING: could not synchronize the public 443/TLS endpoint"
+  fi
+else
+  log "public domain not available at boot; the first public panel request will synchronize it"
+fi
 
 # The shared subscription id used to default to "mobile", which is also what the
 # link on everyone's phone says (/sub/mobile). Renaming the default alone would
@@ -538,19 +639,49 @@ PY
 #
 # So move the existing clients across too. Only a sub_id that is exactly the old
 # default is touched -- anyone who put their own subId on a client keeps it.
-python3 - "$CLIENT_SUBID" <<'PY'
-import sqlite3, sys
-want = sys.argv[1]
+python3 - "$CLIENT_SUBID" "$INBOUND_PORT" <<'PY'
+import json, sqlite3, sys
+want, inbound_port = sys.argv[1], int(sys.argv[2])
 OLD = "mobile"
 if want == OLD:
     sys.exit(0)
 try:
     con = sqlite3.connect("/etc/x-ui/x-ui.db")
-    rows = con.execute("SELECT email FROM clients WHERE sub_id=?", (OLD,)).fetchall()
+    rows = con.execute(
+        "SELECT DISTINCT c.id, c.email FROM clients c "
+        "JOIN client_inbounds ci ON ci.client_id=c.id "
+        "JOIN inbounds i ON i.id=ci.inbound_id "
+        "WHERE c.sub_id=? AND i.port=?",
+        (OLD, inbound_port),
+    ).fetchall()
     if rows:
-        con.execute("UPDATE clients SET sub_id=? WHERE sub_id=?", (want, OLD))
+        ids = [row[0] for row in rows]
+        marks = ",".join("?" for _ in ids)
+        con.execute(
+            f"UPDATE clients SET sub_id=? WHERE id IN ({marks})",
+            (want, *ids),
+        )
+        # Keep the legacy JSON projection consistent as well; older code paths
+        # and backups still inspect this copy.
+        for inbound_id, raw in con.execute(
+                "SELECT id, settings FROM inbounds WHERE port=?",
+                (inbound_port,)).fetchall():
+            try:
+                obj = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            changed = False
+            for client in obj.get("clients", []):
+                if isinstance(client, dict) and client.get("subId") == OLD:
+                    client["subId"] = want
+                    changed = True
+            if changed:
+                con.execute(
+                    "UPDATE inbounds SET settings=? WHERE id=?",
+                    (json.dumps(obj, ensure_ascii=False), inbound_id),
+                )
         con.commit()
-        names = ", ".join(r[0] for r in rows)
+        names = ", ".join(r[1] for r in rows)
         print(f"[entrypoint] moved {len(rows)} client(s) from subId '{OLD}' to "
               f"'{want}': {names}. The subscription link is now /sub/{want}; "
               f"the old /sub/{OLD} no longer resolves, so re-add the link on "
@@ -595,7 +726,7 @@ start_panel() {
 
 stop_panel() {
   if [ -n "${PANEL_PID:-}" ] && kill -0 "$PANEL_PID" 2>/dev/null; then
-    log "stopping panel so Xray picks up the inbound"
+    log "stopping panel"
     kill -TERM "$PANEL_PID" 2>/dev/null || true
     for _ in $(seq 1 30); do
       kill -0 "$PANEL_PID" 2>/dev/null || break
@@ -607,6 +738,29 @@ stop_panel() {
   PANEL_PID=""
 }
 
+# Clean up children on every exit path, including an nginx bind/config failure.
+# Railway kills the whole container, but doing this explicitly prevents a
+# half-started sidecar or daemonised nginx from surviving during local tests.
+SUBPAGE_PID=""
+NGINX_STARTED=0
+RENDERED=""
+cleanup() {
+  status=$?
+  trap - EXIT TERM INT
+  if [ "$NGINX_STARTED" = "1" ] && [ -n "$RENDERED" ]; then
+    nginx -s quit -c "$RENDERED" 2>/dev/null || true
+  fi
+  if [ -n "${SUBPAGE_PID:-}" ]; then
+    kill "$SUBPAGE_PID" 2>/dev/null || true
+    wait "$SUBPAGE_PID" 2>/dev/null || true
+    SUBPAGE_PID=""
+  fi
+  stop_panel
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+
 start_panel
 write_bootstrap
 rm -f "${RUNTIME_DIR}/bootstrap.env"
@@ -615,32 +769,40 @@ rm -f "${RUNTIME_DIR}/bootstrap.env"
 if [ -s "${RUNTIME_DIR}/bootstrap.env" ]; then
   # shellcheck disable=SC1091
   . "${RUNTIME_DIR}/bootstrap.env"
-  # A freshly created or updated inbound only reaches Xray on a relaunch.
-  stop_panel
-  start_panel
-  sleep 3
+  # Only a newly-created inbound needs an Xray relaunch. Existing inbounds are
+  # deliberately never overwritten by bootstrap.
+  if [ "${INBOUND_CHANGED:-0}" = "1" ]; then
+    stop_panel
+    start_panel
+    sleep 3
+  fi
 fi
 
 # --- 5. nginx ----------------------------------------------------------------
 # Bootstrap is skipped on later boots (no stored password to log in with), so
-# read the panel's own subPath from the database rather than assuming /subs/.
-if [ -z "${SUB_REAL_PATH:-}" ]; then
-  SUB_REAL_PATH="$(python3 - <<'PY'
-import sqlite3
+# read all three random subscription paths from the database.
+read_db_setting() {
+  python3 - "$1" "$2" <<'PY'
+import sqlite3, sys
+key, fallback = sys.argv[1:3]
 try:
     con = sqlite3.connect("/etc/x-ui/x-ui.db")
-    row = con.execute("SELECT value FROM settings WHERE key='subPath'").fetchone()
-    print(row[0] if row and row[0] else "/subs/")
+    row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    print(row[0] if row and row[0] else fallback)
 except Exception:
-    print("/subs/")
+    print(fallback)
 PY
-)"
-fi
-SUB_REAL_PATH="${SUB_REAL_PATH:-/subs/}"
-# The viewer page is served at the bare /sub (no trailing slash), while the
-# prefix location below keeps the slash form the proxy rewrite expects.
+}
+SUB_REAL_PATH="${SUB_REAL_PATH:-$(read_db_setting subPath /subs/)}"
+SUB_JSON_REAL_PATH="${SUB_JSON_REAL_PATH:-$(read_db_setting subJsonPath /json/)}"
+SUB_CLASH_REAL_PATH="${SUB_CLASH_REAL_PATH:-$(read_db_setting subClashPath /clash/)}"
+# Bare paths map to the default Sub ID; prefix paths carry an explicit Sub ID.
 SUB_PATH_NOSLASH="${SUB_PATH%/}"
+SUB_JSON_PATH_NOSLASH="${SUB_JSON_PATH%/}"
+SUB_CLASH_PATH_NOSLASH="${SUB_CLASH_PATH%/}"
 [ -n "$SUB_PATH_NOSLASH" ] || SUB_PATH_NOSLASH="/"
+[ -n "$SUB_JSON_PATH_NOSLASH" ] || SUB_JSON_PATH_NOSLASH="/sub-json"
+[ -n "$SUB_CLASH_PATH_NOSLASH" ] || SUB_CLASH_PATH_NOSLASH="/sub-clash"
 RENDERED="${RUNTIME_DIR}/nginx.conf"
 sed -e "s|@@HTTP_PORT@@|${HTTP_PORT}|g" \
     -e "s|@@PANEL_PORT@@|${PANEL_PORT}|g" \
@@ -649,29 +811,50 @@ sed -e "s|@@HTTP_PORT@@|${HTTP_PORT}|g" \
     -e "s|@@SUB_PATH@@|${SUB_PATH}|g" \
     -e "s|@@SUB_PATH_NOSLASH@@|${SUB_PATH_NOSLASH}|g" \
     -e "s|@@SUB_REAL_PATH@@|${SUB_REAL_PATH}|g" \
+    -e "s|@@SUB_JSON_PATH@@|${SUB_JSON_PATH}|g" \
+    -e "s|@@SUB_JSON_PATH_NOSLASH@@|${SUB_JSON_PATH_NOSLASH}|g" \
+    -e "s|@@SUB_JSON_REAL_PATH@@|${SUB_JSON_REAL_PATH}|g" \
+    -e "s|@@SUB_CLASH_PATH@@|${SUB_CLASH_PATH}|g" \
+    -e "s|@@SUB_CLASH_PATH_NOSLASH@@|${SUB_CLASH_PATH_NOSLASH}|g" \
+    -e "s|@@SUB_CLASH_REAL_PATH@@|${SUB_CLASH_REAL_PATH}|g" \
     -e "s|@@INBOUND_PORT@@|${INBOUND_PORT}|g" \
     -e "s|@@TUNNEL_PATH@@|${TUNNEL_PATH}|g" \
     -e "s|@@SUBPAGE_PORT@@|${SUBPAGE_PORT}|g" \
-    -e "s|@@BRAND@@|${BRAND}|g" \
+    -e "s|@@PUBLIC_BRAND@@|${BRAND}|g" \
     /opt/nginx.conf.template > "$RENDERED"
 
 # --- 4b. subscription page ----------------------------------------------------
 # Renders /sub. Needs the panel's real subPath to reach the sub server, so it
 # starts after bootstrap has handed it back.
-SUBPAGE_PID=""
 if [ -f /opt/subserver.py ]; then
   SUBPAGE_PORT="$SUBPAGE_PORT" \
   SUB_PORT="$SUB_PORT" \
   SUB_REAL_PATH="$SUB_REAL_PATH" \
+  SUB_JSON_REAL_PATH="$SUB_JSON_REAL_PATH" \
+  SUB_CLASH_REAL_PATH="$SUB_CLASH_REAL_PATH" \
   SUB_PATH="$SUB_PATH" \
+  SUB_JSON_PATH="$SUB_JSON_PATH" \
+  SUB_CLASH_PATH="$SUB_CLASH_PATH" \
   CLIENT_SUBID="$CLIENT_SUBID" \
+  DB_FILE="$DB_FILE" \
+  INBOUND_PORT="$INBOUND_PORT" \
+  BRAND="$BRAND" \
+  TUNNEL_PATH="$TUNNEL_PATH" \
     python3 /opt/subserver.py &
   SUBPAGE_PID=$!
   log "subscription page started (pid ${SUBPAGE_PID}) on :${SUBPAGE_PORT}"
+  # nginx blocks panel/sub requests on a tiny local auth subrequest, so wait for
+  # Python to bind instead of letting the first phone request race its startup.
+  for _ in $(seq 1 30); do
+    curl -fsS -o /dev/null --max-time 1 \
+      "http://127.0.0.1:${SUBPAGE_PORT}/__catwoman_sync_host" && break
+    sleep 0.2
+  done
 fi
 
 nginx -t -c "$RENDERED" || { log "FATAL: rendered nginx config is invalid"; exit 1; }
-nginx -c "$RENDERED" || { log "FATAL: nginx would not start on :${HTTP_PORT}"; stop_panel; exit 1; }
+nginx -c "$RENDERED" || { log "FATAL: nginx would not start on :${HTTP_PORT}"; exit 1; }
+NGINX_STARTED=1
 # nginx daemonises; give it a moment and confirm it is really serving before
 # announcing success, so a bind failure surfaces here instead of as a 502.
 for _ in $(seq 1 10); do
@@ -692,7 +875,11 @@ echo "=============================================================="
 echo "  Panel          ${PANEL_URL}"
 echo "  Username       ${ADMIN_USERNAME}"
 if [ "$APPLY_CREDS" = "1" ]; then
-  echo "  Password       ${ADMIN_PASSWORD}   (${CREDS_NOTE})"
+  if [ -n "${DEFAULT_CREDS:-}" ]; then
+    echo "  Password       admin   (${CREDS_NOTE})"
+  else
+    echo "  Password       (set from Railway Variables; hidden from logs)"
+  fi
 fi
 if [ -n "${DEFAULT_CREDS:-}" ]; then
   echo
@@ -717,26 +904,21 @@ echo "  Transport      vless + ${TRANSPORT} on path ${TUNNEL_PATH}"
 echo "  Internal       panel :${PANEL_PORT}, sub :${SUB_PORT}, inbound :${INBOUND_PORT}"
 if [ -z "$PUBLIC_HOST" ]; then
   echo
-  echo "  !! No public domain detected. Links above contain <your-domain>."
-  echo "     Railway only injects RAILWAY_PUBLIC_DOMAIN after you press"
-  echo "     'Generate Domain', and it appears on the NEXT deploy. Either"
-  echo "     Generate Domain then Redeploy, or set PUBLIC_HOST explicitly."
+  echo "  !! No public domain was available during startup. Generate a"
+  echo "     Railway Domain, then open the public panel or subscription once;"
+  echo "     the request hostname will repair and persist every public link."
 fi
 echo "=============================================================="
 echo
 
 # --- supervise ---------------------------------------------------------------
-trap 'stop_panel; [ -n "$SUBPAGE_PID" ] && kill "$SUBPAGE_PID" 2>/dev/null; nginx -s quit 2>/dev/null || true; exit 0' TERM INT
-
 while true; do
   if ! kill -0 "$PANEL_PID" 2>/dev/null; then
     log "panel exited; shutting down so Railway restarts the container"
-    nginx -s quit 2>/dev/null || true
     exit 1
   fi
   if ! pgrep -x nginx >/dev/null 2>&1; then
     log "nginx exited; shutting down so Railway restarts the container"
-    stop_panel
     exit 1
   fi
   # The subscription page is not fatal: without it the raw /sub/<id> endpoint
@@ -744,8 +926,14 @@ while true; do
   if [ -n "$SUBPAGE_PID" ] && ! kill -0 "$SUBPAGE_PID" 2>/dev/null; then
     log "subscription page exited; restarting it"
     SUBPAGE_PORT="$SUBPAGE_PORT" SUB_PORT="$SUB_PORT" \
-    SUB_REAL_PATH="$SUB_REAL_PATH" SUB_PATH="$SUB_PATH" \
-    CLIENT_SUBID="$CLIENT_SUBID" \
+    SUB_REAL_PATH="$SUB_REAL_PATH" \
+    SUB_JSON_REAL_PATH="$SUB_JSON_REAL_PATH" \
+    SUB_CLASH_REAL_PATH="$SUB_CLASH_REAL_PATH" \
+    SUB_PATH="$SUB_PATH" SUB_JSON_PATH="$SUB_JSON_PATH" \
+    SUB_CLASH_PATH="$SUB_CLASH_PATH" \
+    CLIENT_SUBID="$CLIENT_SUBID" DB_FILE="$DB_FILE" \
+    INBOUND_PORT="$INBOUND_PORT" BRAND="$BRAND" \
+    TUNNEL_PATH="$TUNNEL_PATH" \
       python3 /opt/subserver.py &
     SUBPAGE_PID=$!
   fi

@@ -1,8 +1,8 @@
 # 3x-ui panel packaged for Railway.
 #
 # Railway gives a service exactly ONE public port and terminates TLS at its own
-# edge, so the panel (2053), the subscription server (2096) and the Xray
-# inbound (10085) all bind to loopback and are split by URL path in nginx.
+# edge, so the panel (2053), subscription server (2096) and Xray inbound
+# (10085) remain internal while nginx splits the one public port by URL path.
 #
 # Mount a Railway Volume at /etc/x-ui or every redeploy wipes your users.
 
@@ -10,7 +10,7 @@ FROM ubuntu:24.04
 
 # Pinned on purpose: the API paths and the inbound payload shape in
 # entrypoint.sh were verified against this exact release.
-ARG XUI_VERSION=v3.9.0
+ARG XUI_VERSION=v3.10.2
 ARG TARGETARCH=amd64
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -23,11 +23,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Fetch the official release tarball rather than the Docker Hub image, which
 # is frequently rate-limited and fails Railway builds.
-# The release tarball's only top-level entry is "x-ui/", and inside it the panel
-# binary is also called "x-ui". So extracting with --strip-components=1 maps
-# x-ui/x-ui onto /usr/local/x-ui -- the very path the directory itself occupies.
-# Do NOT pre-create that directory and do NOT strip: extract as-is and let tar
-# create /usr/local/x-ui/ itself.
+# The release tarball's top-level entry is "x-ui/", and inside it the panel
+# binary is also called "x-ui". Extracting as-is creates
+# /usr/local/x-ui/x-ui. Stripping the first component would instead try to put
+# that binary at /usr/local/x-ui, where the directory itself must live.
 RUN set -eux; \
     case "${TARGETARCH}" in \
         amd64) ARCH=amd64 ;; \
@@ -45,9 +44,10 @@ RUN set -eux; \
 RUN mkdir -p /etc/x-ui /var/log/x-ui /run/nginx
 
 COPY nginx.conf.template /opt/nginx.conf.template
+COPY public_endpoint.py /opt/public_endpoint.py
 COPY subserver.py /opt/subserver.py
 COPY entrypoint.sh /opt/entrypoint.sh
-RUN chmod +x /opt/entrypoint.sh
+RUN chmod +x /opt/entrypoint.sh /opt/public_endpoint.py
 
 # Railway injects PORT; 8080 keeps `docker run` working outside Railway.
 ENV HTTP_PORT=8080

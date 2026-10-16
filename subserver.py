@@ -1,34 +1,49 @@
 #!/usr/bin/env python3
 """A thin forwarder in front of 3x-ui's own subscription server.
 
-The page a browser gets is 3x-ui's built-in subpage.html, untouched -- its own
-title, its own layout, its own assets. This process does not render anything.
-It exists to apply exactly one policy that the sub server itself cannot:
+The browser still receives 3x-ui's built-in Catwoman subscription page. This
+process owns only two Railway edge policies the panel cannot infer reliably:
 
-3x-ui always emits a Subscription-Userinfo header, filling 0 for any limit the
-client does not have (internal/sub/calendar_expire.go formats it straight from
-the client_traffic row), so a client with no cap arrives as
-"upload=0; download=0; total=0; expire=0". Apps such as v2box divide usage by
-total, hit zero, and report an error even though the configs came through fine.
-So the header is forwarded only when it carries something to report.
+* nginx sends the hostname of a real public request to an internal endpoint.
+  Before the panel answers, it synchronizes Catwoman's managed Host, legacy
+  externalProxy and raw/JSON/Clash URIs to HTTPS/443 with matching SNI, WS Host
+  and path.
+* A zero-quota Subscription-Userinfo header is omitted because several clients
+  divide by total=0 and reject an otherwise valid feed.
 
-Everything else -- status, content type, body, and every other header such as
-Profile-Title and Profile-Update-Interval -- passes through as-is.
+Every other status, body and response header passes through unchanged.
 """
 
 import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from public_endpoint import normalize_public_host, sync_public_endpoint
+
 PORT = int(os.environ.get("SUBPAGE_PORT", "2097"))
 SUB_PORT = int(os.environ.get("SUB_PORT", "2096"))
 SUB_REAL_PATH = os.environ.get("SUB_REAL_PATH", "/subs/")
+SUB_JSON_REAL_PATH = os.environ.get("SUB_JSON_REAL_PATH", "/json/")
+SUB_CLASH_REAL_PATH = os.environ.get("SUB_CLASH_REAL_PATH", "/clash/")
 PUBLIC_PATH = os.environ.get("SUB_PATH", "/sub/")
+PUBLIC_JSON_PATH = os.environ.get("SUB_JSON_PATH", "/sub-json/")
+PUBLIC_CLASH_PATH = os.environ.get("SUB_CLASH_PATH", "/sub-clash/")
 DEFAULT_SUBID = os.environ.get("CLIENT_SUBID", "CATWOMAN")
+DB_FILE = os.environ.get("DB_FILE", "/etc/x-ui/x-ui.db")
+INBOUND_PORT = int(os.environ.get("INBOUND_PORT", "10085"))
+BRAND = os.environ.get("BRAND", "CATWOMAN")
+TUNNEL_PATH = os.environ.get("TUNNEL_PATH", "/ws")
+SYNC_PATH = "/__catwoman_sync_host"
+_SYNC_LOCK = threading.Lock()
+_SYNCED_HOST = None
+_SYNCED_AT = 0.0
+SYNC_TTL = 5.0
 
 # User agents that are plainly a browser. Used only to decide whether to ask
 # for the HTML page when Accept is too vague to tell.
@@ -47,8 +62,11 @@ BROWSER_UA = [
 # Headers that must not be echoed back: hop-by-hop ones, plus the ones this
 # process sets itself.
 HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+    # BaseHTTPRequestHandler generates Date and Server itself; forwarding the
+    # upstream copies makes nginx report duplicate response headers.
+    "date", "server", "connection", "keep-alive", "proxy-authenticate",
+    "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
+    "content-length",
 }
 
 
@@ -72,22 +90,54 @@ def has_quota(ui):
 
 
 def to_upstream(path):
-    """Map the public /sub/... path onto the sub server's own random path.
-
-    /sub/CATWOMAN    -> /<subPath>CATWOMAN
-    /sub or /sub/    -> /<subPath><default id>
-    /sub/whatever/x  -> /<subPath>whatever/x
-
-    The bare path has no sub id in it, and the sub server has no index to
-    answer with, so it falls back to the panel's default client. That keeps
-    /sub and /sub/ working instead of 404ing.
-    """
-    base = SUB_REAL_PATH if SUB_REAL_PATH.endswith("/") else SUB_REAL_PATH + "/"
-    if path == PUBLIC_PATH.rstrip("/") or path in ("", "/") or path == PUBLIC_PATH:
-        return base + DEFAULT_SUBID
-    if path.startswith(PUBLIC_PATH):
-        return base + path[len(PUBLIC_PATH):]
+    """Map stable public raw/JSON/Clash paths to 3x-ui's random paths."""
+    mappings = (
+        (PUBLIC_PATH, SUB_REAL_PATH),
+        (PUBLIC_JSON_PATH, SUB_JSON_REAL_PATH),
+        (PUBLIC_CLASH_PATH, SUB_CLASH_REAL_PATH),
+    )
+    for public, private in mappings:
+        public = public if public.endswith("/") else public + "/"
+        private = private if private.endswith("/") else private + "/"
+        if path == public.rstrip("/") or path == public:
+            return private + DEFAULT_SUBID
+        if path.startswith(public):
+            return private + path[len(public):]
+    if path in ("", "/"):
+        private = SUB_REAL_PATH if SUB_REAL_PATH.endswith("/") else SUB_REAL_PATH + "/"
+        return private + DEFAULT_SUBID
     return path
+
+
+def synchronize_request_host(host):
+    """Synchronize at most once per host every few seconds."""
+    global _SYNCED_HOST, _SYNCED_AT
+    now = time.monotonic()
+    if not host or (_SYNCED_HOST == host and now - _SYNCED_AT < SYNC_TTL):
+        return False
+    with _SYNC_LOCK:
+        now = time.monotonic()
+        if _SYNCED_HOST == host and now - _SYNCED_AT < SYNC_TTL:
+            return False
+        result = sync_public_endpoint(
+            DB_FILE,
+            host,
+            inbound_port=INBOUND_PORT,
+            brand=BRAND,
+            sub_path=PUBLIC_PATH,
+            sub_json_path=PUBLIC_JSON_PATH,
+            sub_clash_path=PUBLIC_CLASH_PATH,
+            tunnel_path=TUNNEL_PATH,
+        )
+        _SYNCED_HOST = host
+        _SYNCED_AT = time.monotonic()
+        if result.changed:
+            sys.stderr.write(
+                "[subfwd] Catwoman public endpoint synchronized to "
+                "https://%s:443 (%d database change(s))\n"
+                % (host, result.changed)
+            )
+        return bool(result.changed)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -96,7 +146,25 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
+        # Every panel asset triggers this internal auth subrequest; successful
+        # 204s are routine and would otherwise flood Railway's deployment log.
+        if urllib.parse.urlparse(self.path).path == SYNC_PATH:
+            return
         sys.stderr.write("[subfwd] %s\n" % (fmt % args))
+
+    def _sync_host(self):
+        # nginx marks this URL internal and passes its normalized $host. A
+        # temporary SQLite lock must never take the panel down, so fail open and
+        # retry on the next request instead of returning an auth error.
+        host = normalize_public_host(self.headers.get("X-Public-Host"))
+        try:
+            if host:
+                synchronize_request_host(host)
+        except Exception as exc:  # noqa: BLE001 - logged, then retried later
+            sys.stderr.write("[subfwd] public endpoint sync failed: %s\n" % exc)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _relay(self, method):
         parsed = urllib.parse.urlparse(self.path)
@@ -177,15 +245,26 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
     def do_GET(self):  # noqa: N802
+        if urllib.parse.urlparse(self.path).path == SYNC_PATH:
+            self._sync_host()
+            return
         self._relay("GET")
 
     def do_HEAD(self):  # noqa: N802
+        if urllib.parse.urlparse(self.path).path == SYNC_PATH:
+            self._sync_host()
+            return
         self._relay("HEAD")
 
 
 def main():
-    if not re.match(r"^/[A-Za-z0-9_\-./]*/$", SUB_REAL_PATH):
-        sys.stderr.write("[subfwd] suspicious SUB_REAL_PATH %r\n" % SUB_REAL_PATH)
+    for name, path in (
+        ("SUB_REAL_PATH", SUB_REAL_PATH),
+        ("SUB_JSON_REAL_PATH", SUB_JSON_REAL_PATH),
+        ("SUB_CLASH_REAL_PATH", SUB_CLASH_REAL_PATH),
+    ):
+        if not re.match(r"^/[A-Za-z0-9_\-./]*/$", path):
+            sys.stderr.write("[subfwd] suspicious %s %r\n" % (name, path))
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
